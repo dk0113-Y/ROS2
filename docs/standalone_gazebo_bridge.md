@@ -96,6 +96,25 @@ The node emits structured log prefixes:
 - `bridge_finished`
 - `bridge_failure`
 
+## Local Snap Diagnostics
+
+For cell035 observation alignment, use:
+
+```bash
+bash scripts/run_cell035_local_snap_diagnostic.sh
+```
+
+The diagnostic compares `oracle_los`, `ray_project`, and `los_compatible`
+local snaps from the same `/scan` and `/odom` frame. It can run with
+`diagnostic_no_motion=true`, which prints the report and exits without
+executing a policy action or publishing `/cmd_vel`.
+
+See `docs/cell035_bridge_diagnostics.md` for interpretation. In short,
+pure-grid and `oracle_los` matching first action `SW` indicates that the policy
+and Gazebo control chain are basically aligned. LaserScan modes choosing `SE`
+or `S` at the same start point indicates an observation-bridge mismatch.
+`oracle_los` is a diagnostic upper bound, not deployment-like sensing.
+
 ## Common Failures
 
 - `/scan` is not available.

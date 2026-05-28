@@ -111,6 +111,7 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.runner_started_wall: Optional[float] = None
         self.done = False
         self._oracle_warning_logged = False
+        self._local_snap_diagnostic_done = False
 
         self.true_grid = self._load_true_grid(self.true_grid_path)
         self.true_free_mask = self.GridTopology.free_mask(self.true_grid)
@@ -162,6 +163,10 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.declare_parameter("los_beam_window", 1)
         self.declare_parameter("los_obstacle_tolerance", 0.55)
         self.declare_parameter("stop_repeat", 10)
+        self.declare_parameter("diagnostic_compare_local_snaps", False)
+        self.declare_parameter("diagnostic_print_ascii", False)
+        self.declare_parameter("diagnostic_only_first_step", True)
+        self.declare_parameter("diagnostic_no_motion", False)
 
     def _read_parameters(self) -> None:
         self.drl_repo = self._resolve_path_parameter("drl_repo", must_exist=True)
@@ -196,6 +201,12 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.los_beam_window = int(self.get_parameter("los_beam_window").value)
         self.los_obstacle_tolerance = float(self.get_parameter("los_obstacle_tolerance").value)
         self.stop_repeat = int(self.get_parameter("stop_repeat").value)
+        self.diagnostic_compare_local_snaps = bool(
+            self.get_parameter("diagnostic_compare_local_snaps").value
+        )
+        self.diagnostic_print_ascii = bool(self.get_parameter("diagnostic_print_ascii").value)
+        self.diagnostic_only_first_step = bool(self.get_parameter("diagnostic_only_first_step").value)
+        self.diagnostic_no_motion = bool(self.get_parameter("diagnostic_no_motion").value)
         self.local_size = 2 * self.scan_radius_cells + 1
         self.center = self.scan_radius_cells
 
@@ -245,6 +256,8 @@ class DrlStandaloneGazeboBridgeNode(Node):
             raise ValueError("recent_traj_limit must be >= 1")
         if self.stop_repeat < 1:
             raise ValueError("stop_repeat must be >= 1")
+        if self.diagnostic_no_motion and not self.diagnostic_compare_local_snaps:
+            raise ValueError("diagnostic_no_motion requires diagnostic_compare_local_snaps=true")
 
     def _log_startup_config(self) -> None:
         self.get_logger().info(
@@ -262,7 +275,11 @@ class DrlStandaloneGazeboBridgeNode(Node):
             f"no_progress_limit={self.no_progress_limit} coverage_epsilon={self.coverage_epsilon:.6f} "
             f"recent_traj_limit={self.recent_traj_limit} multi_wall_timeout={self.multi_wall_timeout:.1f} "
             f"step_pause_sec={self.step_pause_sec:.3f} linear_speed={self.linear_speed:.3f} "
-            f"target_pos_tol={self.target_pos_tol:.3f} rotate_tol_deg={math.degrees(self.rotate_tol):.3f}"
+            f"target_pos_tol={self.target_pos_tol:.3f} rotate_tol_deg={math.degrees(self.rotate_tol):.3f} "
+            f"diagnostic_compare_local_snaps={self.diagnostic_compare_local_snaps} "
+            f"diagnostic_print_ascii={self.diagnostic_print_ascii} "
+            f"diagnostic_only_first_step={self.diagnostic_only_first_step} "
+            f"diagnostic_no_motion={self.diagnostic_no_motion}"
         )
 
     def _load_true_grid(self, path: Path) -> np.ndarray:
@@ -331,6 +348,8 @@ class DrlStandaloneGazeboBridgeNode(Node):
         )
 
     def stop(self, repeat: Optional[int] = None) -> None:
+        if getattr(self, "diagnostic_no_motion", False):
+            return
         if not hasattr(self, "cmd_pub") or self.cmd_pub is None:
             return
         count = int(self.stop_repeat if repeat is None else repeat)
@@ -577,6 +596,146 @@ class DrlStandaloneGazeboBridgeNode(Node):
         if self.scan_bridge_mode == "oracle_los":
             return self.build_local_snap_oracle_los(scan, odom)
         raise RuntimeError(f"unsupported scan_bridge_mode={self.scan_bridge_mode!r}")
+
+    def _should_emit_local_snap_diagnostic(self) -> bool:
+        if not self.diagnostic_compare_local_snaps:
+            return False
+        if self.diagnostic_only_first_step and self._local_snap_diagnostic_done:
+            return False
+        return True
+
+    def _snap_counts(self, snap: np.ndarray) -> dict[str, Any]:
+        return {
+            "shape": tuple(int(v) for v in snap.shape),
+            "known_count": int(np.count_nonzero(snap != self.INVISIBLE)),
+            "empty_count": int(np.count_nonzero(snap == self.EMPTY)),
+            "obstacle_count": int(np.count_nonzero(snap == self.OBSTACLE)),
+            "invisible_count": int(np.count_nonzero(snap == self.INVISIBLE)),
+            "center_value": int(snap[self.center, self.center]),
+        }
+
+    def _snap_counts_log_fragment(self, name: str, snap: np.ndarray) -> str:
+        counts = self._snap_counts(snap)
+        return (
+            f"{name}_shape={counts['shape']} "
+            f"{name}_known_count={counts['known_count']} "
+            f"{name}_empty_count={counts['empty_count']} "
+            f"{name}_obstacle_count={counts['obstacle_count']} "
+            f"{name}_invisible_count={counts['invisible_count']} "
+            f"{name}_center_cell_value={counts['center_value']}"
+        )
+
+    def _snap_to_ascii_lines(self, snap: np.ndarray) -> list[str]:
+        chars = {
+            self.INVISIBLE: "?",
+            self.EMPTY: ".",
+            self.OBSTACLE: "#",
+        }
+        lines: list[str] = []
+        for r in range(int(snap.shape[0])):
+            row_chars: list[str] = []
+            for c in range(int(snap.shape[1])):
+                if r == self.center and c == self.center:
+                    row_chars.append("A")
+                else:
+                    row_chars.append(chars.get(int(snap[r, c]), "!"))
+            lines.append("".join(row_chars))
+        return lines
+
+    def _diff_to_ascii_lines(
+        self,
+        oracle: np.ndarray,
+        ray_project: np.ndarray,
+        los_compatible: np.ndarray,
+    ) -> list[str]:
+        lines: list[str] = []
+        for r in range(int(oracle.shape[0])):
+            row_chars: list[str] = []
+            for c in range(int(oracle.shape[1])):
+                ray_mismatch = bool(ray_project[r, c] != oracle[r, c])
+                los_mismatch = bool(los_compatible[r, c] != oracle[r, c])
+                if ray_mismatch and los_mismatch:
+                    row_chars.append("b")
+                elif ray_mismatch:
+                    row_chars.append("r")
+                elif los_mismatch:
+                    row_chars.append("l")
+                else:
+                    row_chars.append(" ")
+            lines.append("".join(row_chars))
+        return lines
+
+    def _log_ascii_snap(self, name: str, snap: np.ndarray) -> None:
+        body = "\n".join(f"{idx:02d} {line}" for idx, line in enumerate(self._snap_to_ascii_lines(snap)))
+        self.get_logger().info(f"local_snap_ascii name={name}\n{body}")
+
+    def _log_ascii_diff(self, oracle: np.ndarray, ray_project: np.ndarray, los_compatible: np.ndarray) -> None:
+        lines = self._diff_to_ascii_lines(oracle, ray_project, los_compatible)
+        body = "\n".join(f"{idx:02d} |{line}|" for idx, line in enumerate(lines))
+        self.get_logger().info(
+            "local_snap_ascii_diff name=diff_vs_oracle legend='space=match,r=ray,l=los,b=both'\n"
+            f"{body}"
+        )
+
+    def emit_local_snap_alignment_diagnostic(self, agent_state: tuple[int, int]) -> None:
+        if self.latest_scan is None or self.latest_odom is None:
+            raise RuntimeError("waiting for /scan and /odom")
+
+        scan = self.latest_scan
+        odom = self.latest_odom
+        oracle = self.build_local_snap_oracle_los(scan, odom)
+        ray_project = self.build_local_snap_ray_project(scan, odom)
+        los_compatible = self.build_local_snap_los_compatible(scan, odom)
+
+        x = float(odom.pose.pose.position.x)
+        y = float(odom.pose.pose.position.y)
+        yaw = yaw_from_quat(odom.pose.pose.orientation)
+        ranges = list(scan.ranges)
+        finite_ranges = [float(v) for v in ranges if math.isfinite(v)]
+        finite_count = int(len(finite_ranges))
+        nan_count = int(sum(1 for v in ranges if math.isnan(float(v))))
+        inf_count = int(sum(1 for v in ranges if math.isinf(float(v))))
+        near_range_max_count = int(
+            sum(1 for v in finite_ranges if float(scan.range_max) - v <= max(1.0e-6, self.cell_size * 0.05))
+        )
+
+        oracle_vs_ray = oracle != ray_project
+        oracle_vs_los = oracle != los_compatible
+        ray_vs_los = ray_project != los_compatible
+
+        self.get_logger().info(
+            "local_snap_alignment "
+            f"step={self.step_count + 1} agent_state={agent_state} "
+            f"odom_xy=({x:.3f},{y:.3f}) yaw={math.degrees(yaw):+.1f}deg "
+            f"scan_angle_min={float(scan.angle_min):+.6f} "
+            f"scan_angle_max={float(scan.angle_max):+.6f} "
+            f"scan_angle_increment={float(scan.angle_increment):+.6f} "
+            f"scan_range_min={float(scan.range_min):.3f} "
+            f"scan_range_max={float(scan.range_max):.3f} "
+            f"scan_ranges_count={len(ranges)} "
+            f"scan_finite_count={finite_count} scan_nan_count={nan_count} "
+            f"scan_inf_count={inf_count} scan_near_range_max_count={near_range_max_count} "
+            f"{self._snap_counts_log_fragment('oracle', oracle)} "
+            f"{self._snap_counts_log_fragment('ray_project', ray_project)} "
+            f"{self._snap_counts_log_fragment('los_compatible', los_compatible)} "
+            f"oracle_vs_ray_mismatch_count={int(np.count_nonzero(oracle_vs_ray))} "
+            f"oracle_vs_los_mismatch_count={int(np.count_nonzero(oracle_vs_los))} "
+            f"ray_vs_los_mismatch_count={int(np.count_nonzero(ray_vs_los))} "
+            f"oracle_empty_ray_invisible_count={int(np.count_nonzero((oracle == self.EMPTY) & (ray_project == self.INVISIBLE)))} "
+            f"oracle_empty_los_invisible_count={int(np.count_nonzero((oracle == self.EMPTY) & (los_compatible == self.INVISIBLE)))} "
+            f"oracle_obstacle_ray_empty_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (ray_project == self.EMPTY)))} "
+            f"oracle_obstacle_los_empty_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (los_compatible == self.EMPTY)))} "
+            f"oracle_obstacle_ray_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (ray_project == self.INVISIBLE)))} "
+            f"oracle_obstacle_los_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (los_compatible == self.INVISIBLE)))}"
+        )
+
+        if self.diagnostic_print_ascii:
+            self._log_ascii_snap("oracle", oracle)
+            self._log_ascii_snap("ray_project", ray_project)
+            self._log_ascii_snap("los_compatible", los_compatible)
+            self._log_ascii_diff(oracle, ray_project, los_compatible)
+
+        self._local_snap_diagnostic_done = True
 
     def update_persistent_belief(self, agent_state: tuple[int, int]) -> tuple[Any, tuple[int, int, int]]:
         if self.latest_scan is None or self.latest_odom is None:
@@ -827,9 +986,17 @@ class DrlStandaloneGazeboBridgeNode(Node):
     def run(self) -> None:
         self.runner_started_wall = time.monotonic()
         try:
-            self._check_cmd_vel_subscriber()
+            if not self.diagnostic_no_motion:
+                self._check_cmd_vel_subscriber()
             self._wait_for_scan_odom()
             self.runner_started_wall = time.monotonic()
+
+            if self.diagnostic_no_motion:
+                agent_state = self.current_agent_state_checked()
+                self.emit_local_snap_alignment_diagnostic(agent_state)
+                self.stop_reason = "diagnostic_no_motion"
+                return
+
             self.stop_reason = "running"
 
             while rclpy.ok():
@@ -838,6 +1005,9 @@ class DrlStandaloneGazeboBridgeNode(Node):
                 if stop_reason is not None:
                     self.stop_reason = stop_reason
                     break
+
+                if self._should_emit_local_snap_diagnostic():
+                    self.emit_local_snap_alignment_diagnostic(self.current_agent_state_checked())
 
                 action_idx, valid, q, cum_map, agent_state, state_meta, update_result = self.infer_action()
                 target_state, (tx, ty) = self._target_for_action(action_idx, agent_state)
