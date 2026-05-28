@@ -29,6 +29,7 @@ setup(
             'drl_policy_probe = drl_explore_bridge.drl_policy_probe_node:main',
             'drl_policy_step_once_node = drl_explore_bridge.drl_policy_step_once_node:main',
             'drl_policy_multi_step_node = drl_explore_bridge.drl_policy_multi_step_node:main',
+            'drl_standalone_gazebo_bridge_node = drl_explore_bridge.drl_standalone_gazebo_bridge_node:main',
         ],
     },
 )
