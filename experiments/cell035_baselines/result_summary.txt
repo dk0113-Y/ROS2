@@ -1,0 +1,29 @@
+Experiment: drl_cell035_last_400
+Checkpoint: last.pt
+World: random_train_like_seed20260513_cell035.world
+Grid: random_train_like_seed20260513_true_grid.npy
+Robot URDF: mini_4wd_robot_with_laser_drive_cell035.urdf
+
+Parameters:
+cell_size=0.35
+world_x=21.0
+world_y=14.0
+scan_radius_cells=10
+lidar_range_min=0.15
+lidar_range_max=3.5
+max_steps=400
+coverage_goal=0.95
+no_progress_limit=120
+
+Result:
+STOP: coverage_goal reached
+steps=207
+best_coverage=0.9504
+no_progress_count=0
+
+Baseline:
+old best_old_cell035_baseline.pt reached best_coverage=0.8751 and stopped by no_progress_limit at step 319.
+
+Conclusion:
+last.pt significantly improves exploration performance in the cell035 Gazebo deployment setting.
+It reaches the 0.95 coverage target in 207 steps and does not show late-stage no-progress stagnation in this run.

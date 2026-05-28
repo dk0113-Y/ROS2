@@ -1,0 +1,11 @@
+step=1 action=2:E known=205 frontier=32 coverage=0.0997 best=0.0997
+step=20 action=6:W known=463 frontier=41 coverage=0.2241 best=0.2241
+step=40 action=0:N known=774 frontier=55 coverage=0.3753 best=0.3753
+step=60 action=4:S known=868 frontier=56 coverage=0.4200 best=0.4200
+step=80 action=4:S known=991 frontier=72 coverage=0.4784 best=0.4784
+step=100 action=2:E known=1190 frontier=66 coverage=0.5737 best=0.5737
+step=120 action=3:SE known=1498 frontier=47 coverage=0.7229 best=0.7229
+step=140 action=0:N known=1608 frontier=42 coverage=0.7759 best=0.7759
+step=160 action=3:SE known=1760 frontier=19 coverage=0.8483 best=0.8483
+step=180 action=2:E known=1925 frontier=38 coverage=0.9285 best=0.9285
+step=200 action=4:S known=1962 frontier=27 coverage=0.9446 best=0.9446

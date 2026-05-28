@@ -1,0 +1,31 @@
+# ROS2 build outputs
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Local/runtime cache
+.cache/
+.ros/
+.gazebo/
+.vscode/
+.idea/
+
+# Bags and large runtime data
+*.bag
+*.db3
+*.mcap
+
+# Model weights: keep in DRL-path-finding or releases, not this repo
+*.pt
+*.pth
+*.onnx
+
+# Temporary generated files
+tmp/
+tmp_*/
