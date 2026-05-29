@@ -27,6 +27,7 @@ if [[ ! -f "$ROS_SETUP" ]]; then
   echo "ROS setup file not found: $ROS_SETUP" >&2
   exit 1
 fi
+export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
 source "$ROS_SETUP"
 
 if [[ ! -d "$ROS_WS/src/drl_explore_bridge" ]]; then
@@ -48,6 +49,7 @@ fi
 
 cd "$ROS_WS"
 colcon build --packages-select drl_explore_bridge --symlink-install
+export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
 source install/setup.bash
 
 ros2 run drl_explore_bridge drl_standalone_gazebo_bridge_node --ros-args \

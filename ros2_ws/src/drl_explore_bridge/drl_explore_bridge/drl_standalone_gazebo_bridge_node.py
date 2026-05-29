@@ -16,7 +16,7 @@ from sensor_msgs.msg import LaserScan
 
 
 ACTION_NAMES = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-SUPPORTED_SCAN_BRIDGE_MODES = ("ray_project", "los_compatible", "oracle_los")
+SUPPORTED_SCAN_BRIDGE_MODES = ("ray_project", "los_compatible", "scan_template_los", "oracle_los")
 
 
 def yaw_from_quat(q: Any) -> float:
@@ -117,6 +117,7 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.true_free_mask = self.GridTopology.free_mask(self.true_grid)
         self.adapter = self.StateTensorAdapter(device="cpu")
         self.net = self._load_policy(self.checkpoint_path)
+        self.scan_template_los_rays: Optional[tuple[tuple[tuple[int, int, int, int], ...], ...]] = None
 
         self.scan_sub = self.create_subscription(LaserScan, "/scan", self.scan_cb, 10)
         self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_cb, 10)
@@ -162,6 +163,10 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.declare_parameter("control_debug_period", 1.0)
         self.declare_parameter("los_beam_window", 1)
         self.declare_parameter("los_obstacle_tolerance", 0.55)
+        self.declare_parameter("scan_template_los_beam_window", 1)
+        self.declare_parameter("scan_template_los_range_margin_m", -1.0)
+        self.declare_parameter("scan_template_los_enable_corner_blocking", True)
+        self.declare_parameter("scan_template_los_use_training_templates", True)
         self.declare_parameter("stop_repeat", 10)
         self.declare_parameter("diagnostic_compare_local_snaps", False)
         self.declare_parameter("diagnostic_print_ascii", False)
@@ -200,6 +205,18 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self.control_debug_period = float(self.get_parameter("control_debug_period").value)
         self.los_beam_window = int(self.get_parameter("los_beam_window").value)
         self.los_obstacle_tolerance = float(self.get_parameter("los_obstacle_tolerance").value)
+        self.scan_template_los_beam_window = int(
+            self.get_parameter("scan_template_los_beam_window").value
+        )
+        self.scan_template_los_range_margin_m = float(
+            self.get_parameter("scan_template_los_range_margin_m").value
+        )
+        self.scan_template_los_enable_corner_blocking = bool(
+            self.get_parameter("scan_template_los_enable_corner_blocking").value
+        )
+        self.scan_template_los_use_training_templates = bool(
+            self.get_parameter("scan_template_los_use_training_templates").value
+        )
         self.stop_repeat = int(self.get_parameter("stop_repeat").value)
         self.diagnostic_compare_local_snaps = bool(
             self.get_parameter("diagnostic_compare_local_snaps").value
@@ -256,6 +273,16 @@ class DrlStandaloneGazeboBridgeNode(Node):
             raise ValueError("recent_traj_limit must be >= 1")
         if self.stop_repeat < 1:
             raise ValueError("stop_repeat must be >= 1")
+        if self.scan_template_los_beam_window < 0:
+            raise ValueError("scan_template_los_beam_window must be >= 0")
+        if (
+            not self.scan_template_los_use_training_templates
+            and (self.scan_bridge_mode == "scan_template_los" or self.diagnostic_compare_local_snaps)
+        ):
+            raise ValueError(
+                "scan_template_los_use_training_templates=false is not supported; "
+                "scan_template_los must use DRL-path-finding RadarSensor.local_ray_templates"
+            )
         if self.diagnostic_no_motion and not self.diagnostic_compare_local_snaps:
             raise ValueError("diagnostic_no_motion requires diagnostic_compare_local_snaps=true")
 
@@ -276,6 +303,10 @@ class DrlStandaloneGazeboBridgeNode(Node):
             f"recent_traj_limit={self.recent_traj_limit} multi_wall_timeout={self.multi_wall_timeout:.1f} "
             f"step_pause_sec={self.step_pause_sec:.3f} linear_speed={self.linear_speed:.3f} "
             f"target_pos_tol={self.target_pos_tol:.3f} rotate_tol_deg={math.degrees(self.rotate_tol):.3f} "
+            f"scan_template_los_beam_window={self.scan_template_los_beam_window} "
+            f"scan_template_los_range_margin_m={self.scan_template_los_range_margin_m:.3f} "
+            f"scan_template_los_enable_corner_blocking={self.scan_template_los_enable_corner_blocking} "
+            f"scan_template_los_use_training_templates={self.scan_template_los_use_training_templates} "
             f"diagnostic_compare_local_snaps={self.diagnostic_compare_local_snaps} "
             f"diagnostic_print_ascii={self.diagnostic_print_ascii} "
             f"diagnostic_only_first_step={self.diagnostic_only_first_step} "
@@ -319,6 +350,44 @@ class DrlStandaloneGazeboBridgeNode(Node):
             f"path={checkpoint_path} key=online_state_dict strict=True params={param_count}"
         )
         return net
+
+    def _get_scan_template_los_rays(self) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+        if self.scan_template_los_rays is None:
+            self.scan_template_los_rays = self._load_scan_template_los_rays()
+        return self.scan_template_los_rays
+
+    def _load_scan_template_los_rays(self) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+        if not self.scan_template_los_use_training_templates:
+            raise RuntimeError(
+                "scan_template_los requires DRL-path-finding RadarSensor.local_ray_templates; "
+                "no fallback template implementation is used in this bridge"
+            )
+
+        repo_s = str(self.drl_repo)
+        if repo_s not in sys.path:
+            sys.path.insert(0, repo_s)
+        try:
+            from env.core_radar import RadarSensor  # pylint: disable=import-outside-toplevel
+        except Exception as exc:
+            raise RuntimeError(
+                f"scan_template_los failed to import RadarSensor from {repo_s}: {exc}"
+            ) from exc
+
+        sensor = RadarSensor(scan_radius=int(self.scan_radius_cells))
+        rays = tuple(tuple(tuple(int(v) for v in point) for point in ray) for ray in sensor.local_ray_templates)
+        expected = (self.local_size, self.local_size)
+        if tuple(int(v) for v in sensor.local_shape) != expected:
+            raise RuntimeError(
+                "scan_template_los RadarSensor local_shape mismatch: "
+                f"got {sensor.local_shape}, expected {expected}"
+            )
+        if not rays:
+            raise RuntimeError("scan_template_los RadarSensor.local_ray_templates is empty")
+        self.get_logger().info(
+            "scan_template_los_templates_loaded "
+            f"rays={len(rays)} scan_radius_cells={self.scan_radius_cells} local_shape={expected}"
+        )
+        return rays
 
     def scan_cb(self, msg: LaserScan) -> None:
         self.latest_scan = msg
@@ -393,6 +462,51 @@ class DrlStandaloneGazeboBridgeNode(Node):
         elif snap[lr, lc] == self.INVISIBLE:
             snap[lr, lc] = self.EMPTY
 
+    def _mark_local_index(self, snap: np.ndarray, local_r: int, local_c: int, value: int) -> None:
+        lr = int(local_r)
+        lc = int(local_c)
+        if not (0 <= lr < self.local_size and 0 <= lc < self.local_size):
+            return
+        if int(value) == self.OBSTACLE:
+            snap[lr, lc] = self.OBSTACLE
+        elif snap[lr, lc] == self.INVISIBLE:
+            snap[lr, lc] = self.EMPTY
+
+    def _scan_template_los_range_margin(self) -> float:
+        if self.scan_template_los_range_margin_m > 0.0:
+            return float(self.scan_template_los_range_margin_m)
+        # Half a cell bridges LaserScan's continuous hit distance to the
+        # training observation's cell-center LOS decision boundary.
+        return 0.5 * float(self.cell_size)
+
+    def _scan_template_los_corner_blocked(
+        self,
+        snap: np.ndarray,
+        prev_rel_r: Optional[int],
+        prev_rel_c: Optional[int],
+        rel_r: int,
+        rel_c: int,
+    ) -> bool:
+        if not self.scan_template_los_enable_corner_blocking:
+            return False
+        if prev_rel_r is None or prev_rel_c is None:
+            return False
+        if abs(int(rel_r) - int(prev_rel_r)) != 1 or abs(int(rel_c) - int(prev_rel_c)) != 1:
+            return False
+
+        side_a = (self.center + int(rel_r), self.center + int(prev_rel_c))
+        side_b = (self.center + int(prev_rel_r), self.center + int(rel_c))
+        for lr, lc in (side_a, side_b):
+            if not (0 <= lr < self.local_size and 0 <= lc < self.local_size):
+                return False
+
+        # LaserScan-only best effort: exact training corner blocking checks
+        # true side cells. Here we only block when both side cells have already
+        # been inferred as visible obstacles in this local snap.
+        return bool(snap[side_a[0], side_a[1]] == self.OBSTACLE) and bool(
+            snap[side_b[0], side_b[1]] == self.OBSTACLE
+        )
+
     def _ray_to_local_cells(self, angle_world: float, dist: float, hit_obstacle: bool):
         step = max(1.0e-6, self.cell_size / 3.0)
         max_d = max(0.0, float(dist))
@@ -458,7 +572,12 @@ class DrlStandaloneGazeboBridgeNode(Node):
             return None
         return min(valid, key=lambda a: abs(a - angle))
 
-    def _scan_range_at_angle(self, scan: LaserScan, scan_angle: float) -> tuple[float, bool]:
+    def _scan_range_at_angle(
+        self,
+        scan: LaserScan,
+        scan_angle: float,
+        beam_window: Optional[int] = None,
+    ) -> tuple[float, bool]:
         if len(scan.ranges) <= 0 or float(scan.angle_increment) == 0.0:
             return float(scan.range_max), False
 
@@ -471,7 +590,7 @@ class DrlStandaloneGazeboBridgeNode(Node):
 
         idx = int(round((normalized - angle_min) / angle_inc))
         idx = max(0, min(len(scan.ranges) - 1, idx))
-        window = max(0, int(self.los_beam_window))
+        window = max(0, int(self.los_beam_window if beam_window is None else beam_window))
         i0 = max(0, idx - window)
         i1 = min(len(scan.ranges), idx + window + 1)
 
@@ -554,6 +673,65 @@ class DrlStandaloneGazeboBridgeNode(Node):
 
         return snap
 
+    def build_local_snap_scan_template_los(self, scan: LaserScan, odom: Odometry) -> np.ndarray:
+        robot_yaw = yaw_from_quat(odom.pose.pose.orientation)
+        snap = np.full((self.local_size, self.local_size), self.INVISIBLE, dtype=np.int8)
+        snap[self.center, self.center] = self.EMPTY
+
+        range_margin = self._scan_template_los_range_margin()
+        max_range = float(scan.range_max)
+
+        for ray in self._get_scan_template_los_rays():
+            prev_rel_r: Optional[int] = None
+            prev_rel_c: Optional[int] = None
+            for rel_r, rel_c, local_r, local_c in ray:
+                rel_r_i = int(rel_r)
+                rel_c_i = int(rel_c)
+                if rel_r_i == 0 and rel_c_i == 0:
+                    self._mark_local_index(snap, local_r, local_c, self.EMPTY)
+                    prev_rel_r = rel_r_i
+                    prev_rel_c = rel_c_i
+                    continue
+
+                if self._scan_template_los_corner_blocked(
+                    snap,
+                    prev_rel_r,
+                    prev_rel_c,
+                    rel_r_i,
+                    rel_c_i,
+                ):
+                    break
+
+                rel_x = float(rel_c_i) * self.cell_size
+                rel_y = -float(rel_r_i) * self.cell_size
+                cell_dist = math.hypot(rel_x, rel_y)
+                angle_world_local = math.atan2(rel_y, rel_x)
+                scan_angle = norm_angle(angle_world_local - robot_yaw - self.laser_yaw_in_base)
+                measured_dist, hit_obstacle = self._scan_range_at_angle(
+                    scan,
+                    scan_angle,
+                    self.scan_template_los_beam_window,
+                )
+
+                if cell_dist > max_range + range_margin:
+                    break
+                if not hit_obstacle:
+                    self._mark_local_index(snap, local_r, local_c, self.EMPTY)
+                    prev_rel_r = rel_r_i
+                    prev_rel_c = rel_c_i
+                    continue
+                if cell_dist < measured_dist - range_margin:
+                    self._mark_local_index(snap, local_r, local_c, self.EMPTY)
+                    prev_rel_r = rel_r_i
+                    prev_rel_c = rel_c_i
+                    continue
+                if abs(cell_dist - measured_dist) <= range_margin:
+                    self._mark_local_index(snap, local_r, local_c, self.OBSTACLE)
+                    break
+                break
+
+        return snap
+
     def build_local_snap_oracle_los(self, scan: LaserScan, odom: Odometry) -> np.ndarray:
         del scan
         if not self._oracle_warning_logged:
@@ -593,6 +771,8 @@ class DrlStandaloneGazeboBridgeNode(Node):
             return self.build_local_snap_ray_project(scan, odom)
         if self.scan_bridge_mode == "los_compatible":
             return self.build_local_snap_los_compatible(scan, odom)
+        if self.scan_bridge_mode == "scan_template_los":
+            return self.build_local_snap_scan_template_los(scan, odom)
         if self.scan_bridge_mode == "oracle_los":
             return self.build_local_snap_oracle_los(scan, odom)
         raise RuntimeError(f"unsupported scan_bridge_mode={self.scan_bridge_mode!r}")
@@ -647,6 +827,7 @@ class DrlStandaloneGazeboBridgeNode(Node):
         oracle: np.ndarray,
         ray_project: np.ndarray,
         los_compatible: np.ndarray,
+        scan_template_los: np.ndarray,
     ) -> list[str]:
         lines: list[str] = []
         for r in range(int(oracle.shape[0])):
@@ -654,12 +835,21 @@ class DrlStandaloneGazeboBridgeNode(Node):
             for c in range(int(oracle.shape[1])):
                 ray_mismatch = bool(ray_project[r, c] != oracle[r, c])
                 los_mismatch = bool(los_compatible[r, c] != oracle[r, c])
-                if ray_mismatch and los_mismatch:
+                template_mismatch = bool(scan_template_los[r, c] != oracle[r, c])
+                if ray_mismatch and los_mismatch and template_mismatch:
+                    row_chars.append("a")
+                elif ray_mismatch and los_mismatch:
                     row_chars.append("b")
+                elif ray_mismatch and template_mismatch:
+                    row_chars.append("R")
+                elif los_mismatch and template_mismatch:
+                    row_chars.append("L")
                 elif ray_mismatch:
                     row_chars.append("r")
                 elif los_mismatch:
                     row_chars.append("l")
+                elif template_mismatch:
+                    row_chars.append("t")
                 else:
                     row_chars.append(" ")
             lines.append("".join(row_chars))
@@ -669,11 +859,18 @@ class DrlStandaloneGazeboBridgeNode(Node):
         body = "\n".join(f"{idx:02d} {line}" for idx, line in enumerate(self._snap_to_ascii_lines(snap)))
         self.get_logger().info(f"local_snap_ascii name={name}\n{body}")
 
-    def _log_ascii_diff(self, oracle: np.ndarray, ray_project: np.ndarray, los_compatible: np.ndarray) -> None:
-        lines = self._diff_to_ascii_lines(oracle, ray_project, los_compatible)
+    def _log_ascii_diff(
+        self,
+        oracle: np.ndarray,
+        ray_project: np.ndarray,
+        los_compatible: np.ndarray,
+        scan_template_los: np.ndarray,
+    ) -> None:
+        lines = self._diff_to_ascii_lines(oracle, ray_project, los_compatible, scan_template_los)
         body = "\n".join(f"{idx:02d} |{line}|" for idx, line in enumerate(lines))
         self.get_logger().info(
-            "local_snap_ascii_diff name=diff_vs_oracle legend='space=match,r=ray,l=los,b=both'\n"
+            "local_snap_ascii_diff name=diff_vs_oracle "
+            "legend='space=match,r=ray,l=los,t=scan_template,b=ray+los,R=ray+scan_template,L=los+scan_template,a=all'\n"
             f"{body}"
         )
 
@@ -686,6 +883,7 @@ class DrlStandaloneGazeboBridgeNode(Node):
         oracle = self.build_local_snap_oracle_los(scan, odom)
         ray_project = self.build_local_snap_ray_project(scan, odom)
         los_compatible = self.build_local_snap_los_compatible(scan, odom)
+        scan_template_los = self.build_local_snap_scan_template_los(scan, odom)
 
         x = float(odom.pose.pose.position.x)
         y = float(odom.pose.pose.position.y)
@@ -701,7 +899,10 @@ class DrlStandaloneGazeboBridgeNode(Node):
 
         oracle_vs_ray = oracle != ray_project
         oracle_vs_los = oracle != los_compatible
+        oracle_vs_scan_template_los = oracle != scan_template_los
         ray_vs_los = ray_project != los_compatible
+        ray_vs_scan_template_los = ray_project != scan_template_los
+        los_vs_scan_template_los = los_compatible != scan_template_los
 
         self.get_logger().info(
             "local_snap_alignment "
@@ -718,22 +919,30 @@ class DrlStandaloneGazeboBridgeNode(Node):
             f"{self._snap_counts_log_fragment('oracle', oracle)} "
             f"{self._snap_counts_log_fragment('ray_project', ray_project)} "
             f"{self._snap_counts_log_fragment('los_compatible', los_compatible)} "
+            f"{self._snap_counts_log_fragment('scan_template_los', scan_template_los)} "
             f"oracle_vs_ray_mismatch_count={int(np.count_nonzero(oracle_vs_ray))} "
             f"oracle_vs_los_mismatch_count={int(np.count_nonzero(oracle_vs_los))} "
+            f"oracle_vs_scan_template_los_mismatch_count={int(np.count_nonzero(oracle_vs_scan_template_los))} "
             f"ray_vs_los_mismatch_count={int(np.count_nonzero(ray_vs_los))} "
+            f"ray_vs_scan_template_los_mismatch_count={int(np.count_nonzero(ray_vs_scan_template_los))} "
+            f"los_vs_scan_template_los_mismatch_count={int(np.count_nonzero(los_vs_scan_template_los))} "
             f"oracle_empty_ray_invisible_count={int(np.count_nonzero((oracle == self.EMPTY) & (ray_project == self.INVISIBLE)))} "
             f"oracle_empty_los_invisible_count={int(np.count_nonzero((oracle == self.EMPTY) & (los_compatible == self.INVISIBLE)))} "
+            f"oracle_empty_scan_template_los_invisible_count={int(np.count_nonzero((oracle == self.EMPTY) & (scan_template_los == self.INVISIBLE)))} "
             f"oracle_obstacle_ray_empty_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (ray_project == self.EMPTY)))} "
             f"oracle_obstacle_los_empty_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (los_compatible == self.EMPTY)))} "
+            f"oracle_obstacle_scan_template_los_empty_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (scan_template_los == self.EMPTY)))} "
             f"oracle_obstacle_ray_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (ray_project == self.INVISIBLE)))} "
-            f"oracle_obstacle_los_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (los_compatible == self.INVISIBLE)))}"
+            f"oracle_obstacle_los_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (los_compatible == self.INVISIBLE)))} "
+            f"oracle_obstacle_scan_template_los_invisible_count={int(np.count_nonzero((oracle == self.OBSTACLE) & (scan_template_los == self.INVISIBLE)))}"
         )
 
         if self.diagnostic_print_ascii:
             self._log_ascii_snap("oracle", oracle)
             self._log_ascii_snap("ray_project", ray_project)
             self._log_ascii_snap("los_compatible", los_compatible)
-            self._log_ascii_diff(oracle, ray_project, los_compatible)
+            self._log_ascii_snap("scan_template_los", scan_template_los)
+            self._log_ascii_diff(oracle, ray_project, los_compatible, scan_template_los)
 
         self._local_snap_diagnostic_done = True
 

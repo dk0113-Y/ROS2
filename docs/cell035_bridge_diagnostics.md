@@ -50,6 +50,22 @@ queries LaserScan by target angle. It is still only an approximation:
 - Its circular support omits the `RadarSensor` cardinal shoulder cells at the
   scan-radius boundary.
 
+`scan_template_los` addresses the main observation mismatch by making
+DRL-path-finding `RadarSensor.local_ray_templates` the outer loop. For each
+training LOS ray, it walks cells from near to far with the same local
+`(rel_r, rel_c, local_r, local_c)` template coordinates used by
+`LocalObservationModel`: visible free cells become empty, the first visible
+LaserScan hit becomes obstacle, and cells beyond the first hit remain
+invisible. It writes by template local index, so shoulder cells from the
+training footprint are preserved.
+
+`scan_template_los` is still a LaserScan-only approximation. It does not read
+`true_grid`; finite ranges from `/scan` are the only obstacle evidence. Corner
+blocking is best effort: on diagonal ray steps, the bridge stops only when both
+side cells have already been inferred as visible obstacles in the same local
+snap. Exact corner blocking uses true side cells and remains available only in
+the `oracle_los` diagnostic upper bound.
+
 These differences can reduce initial known/free cells and shift Q-values enough
 to change the first action.
 
@@ -59,6 +75,19 @@ Start Gazebo world, robot, `/scan`, and `/odom`, then run:
 
 ```bash
 bash scripts/run_cell035_local_snap_diagnostic.sh
+```
+
+To make the deployed bridge mode itself `scan_template_los` while still
+comparing all four local snaps:
+
+```bash
+bash scripts/run_cell035_scan_template_los_diagnostic.sh
+```
+
+or:
+
+```bash
+SCAN_BRIDGE_MODE=scan_template_los bash scripts/run_cell035_local_snap_diagnostic.sh
 ```
 
 The diagnostic script uses:
@@ -72,6 +101,13 @@ With `diagnostic_no_motion=true`, the node waits for `/scan` and `/odom`,
 prints the alignment report, and exits without executing a policy action or
 publishing `/cmd_vel`.
 
+After the no-motion check, validate progressively:
+
+1. `diagnostic_no_motion=true`
+2. `MAX_STEPS=5`
+3. `MAX_STEPS=40`
+4. `MAX_STEPS=300` or `MAX_STEPS=400`
+
 ## Reading The Output
 
 The `local_snap_alignment` line reports:
@@ -79,10 +115,25 @@ The `local_snap_alignment` line reports:
 - per-snap `known_count`, `empty_count`, `obstacle_count`, `invisible_count`
 - `oracle_vs_ray_mismatch_count`
 - `oracle_vs_los_mismatch_count`
+- `oracle_vs_scan_template_los_mismatch_count`
 - `ray_vs_los_mismatch_count`
+- `ray_vs_scan_template_los_mismatch_count`
+- `los_vs_scan_template_los_mismatch_count`
 - cases where oracle-visible free cells become invisible in LaserScan modes
 - cases where oracle-visible obstacle cells become empty or invisible
 - LaserScan angle/range metadata and finite/inf/nan range counts
+
+Current acceptance targets for the first no-motion diagnostic are:
+
+- `scan_template_los_known_count` should be closer to `oracle_los` than
+  `los_compatible` is.
+- `oracle_vs_scan_template_los_mismatch_count` should be below the previous
+  `los_compatible` value of 54, ideally near or below the `ray_project` value
+  of 39.
+- `oracle_obstacle_scan_template_los_invisible_count` should be below the
+  previous `los_compatible` value of 22.
+- First action returning to `SW` is a strong signal, but it is not a static code
+  acceptance condition; confirm it in Linux Gazebo diagnostics.
 
 The ASCII maps use:
 
@@ -96,4 +147,8 @@ The diff map compares each LaserScan mode to oracle:
 - space: both match oracle
 - `r`: only `ray_project` differs from oracle
 - `l`: only `los_compatible` differs from oracle
-- `b`: both differ from oracle
+- `t`: only `scan_template_los` differs from oracle
+- `b`: `ray_project` and `los_compatible` differ from oracle
+- `R`: `ray_project` and `scan_template_los` differ from oracle
+- `L`: `los_compatible` and `scan_template_los` differ from oracle
+- `a`: all three LaserScan modes differ from oracle
