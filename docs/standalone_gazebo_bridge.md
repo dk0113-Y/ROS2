@@ -6,6 +6,19 @@ and `/odom`, maintains the cumulative belief map, runs the DRL policy, converts
 the selected discrete action to a target grid cell, and publishes `/cmd_vel`
 until the target cell or a stop condition is reached.
 
+For the current cell035 validation route, prefer
+`drl_trajectory_replay_node` when the goal is SLAM mapping from an offline
+oracle/ideal trajectory. That route is documented in
+`docs/trajectory_replay_slam_mapping.md` as:
+
+```text
+Oracle-planned trajectory replay with SLAM mapping
+```
+
+It replays CSV waypoints from the DRL-path-finding oracle exporter and uses
+Gazebo `/scan` only for the external SLAM process. It is not closed-loop
+LaserScan-conditioned DRL exploration.
+
 ## Scope
 
 - The node is independent from the older ROS2 bridge node files and does not
@@ -154,3 +167,18 @@ or `S` at the same start point indicates an observation-bridge mismatch.
 - `true_grid` shape does not match `rows x cols`.
 - `cell_size`, `world_x`, or `world_y` do not match the Gazebo world.
 - `laser_yaw_in_base` needs calibration for the robot sensor frame.
+
+## Trajectory Replay Alternative
+
+To validate physical executability without relying on the current
+LaserScan-to-local_snap bridge, export an oracle/ideal DRL trajectory and run:
+
+```bash
+bash scripts/run_cell035_trajectory_replay.sh
+```
+
+The replay node only subscribes to `/odom` and publishes `/cmd_vel`; it does
+not load the DRL policy or consume `/scan`. Start `slam_toolbox` manually if
+you want `/scan` mapping during replay. This is a trajectory-level
+executability and mapping demonstration, not a real-sensor closed-loop DRL
+result.
