@@ -3,9 +3,9 @@
 <package format="3">
   <name>drl_explore_bridge</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="2731967162@qq.com">dk</maintainer>
-  <license>TODO: License declaration</license>
+  <description>ROS2/Gazebo bridge and diagnostics for DRL autonomous exploration simulation.</description>
+  <maintainer email="maintainer@example.com">portfolio maintainer</maintainer>
+  <license>LicenseRef-Research-Portfolio</license>
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>

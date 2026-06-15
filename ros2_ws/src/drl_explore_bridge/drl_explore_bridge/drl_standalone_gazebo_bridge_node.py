@@ -126,10 +126,10 @@ class DrlStandaloneGazeboBridgeNode(Node):
         self._log_startup_config()
 
     def _declare_parameters(self) -> None:
-        self.declare_parameter("drl_repo", "/home/dk/drl_repos/DRL-path-finding")
+        self.declare_parameter("drl_repo", "~/drl_repos/DRL-path-finding")
         self.declare_parameter(
             "checkpoint_path",
-            "/home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/last.pt",
+            "~/drl_repos/DRL-path-finding/deploy_checkpoints/last.pt",
         )
         self.declare_parameter(
             "true_grid_path",

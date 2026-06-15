@@ -89,7 +89,7 @@ class DrlTrajectoryReplayNode(Node):
     def _declare_parameters(self) -> None:
         self.declare_parameter(
             "trajectory_csv",
-            "/home/dk/ros2_repos/ROS2/assets/cell035/trajectories/cell035_oracle_trajectory.csv",
+            "~/ROS2/assets/cell035/trajectories/cell035_oracle_trajectory.csv",
         )
         self.declare_parameter("cell_size", 0.35)
         self.declare_parameter("world_x", 21.0)
@@ -112,8 +112,8 @@ class DrlTrajectoryReplayNode(Node):
         self.declare_parameter("waypoint_pause_sec", 0.3)
         self.declare_parameter("stop_repeat", 10)
         self.declare_parameter("control_debug_period", 1.0)
-        self.declare_parameter("summary_output", "/home/dk/ros2_repos/ROS2/trajectory_replay_summary.json")
-        self.declare_parameter("trajectory_log_output", "/home/dk/ros2_repos/ROS2/trajectory_replay_log.csv")
+        self.declare_parameter("summary_output", "~/ROS2/trajectory_replay_summary.json")
+        self.declare_parameter("trajectory_log_output", "~/ROS2/trajectory_replay_log.csv")
         self.declare_parameter("diagnostic_no_motion", False)
 
     def _read_parameters(self) -> None:

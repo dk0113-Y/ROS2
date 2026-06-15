@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROS_REPO="${ROS_REPO:-/home/dk/ros2_repos/ROS2}"
+ROS_REPO="${ROS_REPO:-$HOME/ROS2}"
 ROS_WS="${ROS_WS:-$ROS_REPO/ros2_ws}"
 ROS_DISTRO="${ROS_DISTRO:-humble}"
 

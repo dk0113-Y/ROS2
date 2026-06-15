@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROS_REPO="${ROS_REPO:-/home/dk/ros2_repos/ROS2}"
+ROS_REPO="${ROS_REPO:-$HOME/ROS2}"
 ROS_WS="${ROS_WS:-$ROS_REPO/ros2_ws}"
-DRL_REPO="${DRL_REPO:-/home/dk/drl_repos/DRL-path-finding}"
+DRL_REPO="${DRL_REPO:-$HOME/drl_repos/DRL-path-finding}"
 ROS_DISTRO="${ROS_DISTRO:-humble}"
 
-CHECKPOINT="${CHECKPOINT:-/home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/A_full_method_last.pt}"
-TRUE_GRID="${TRUE_GRID:-/home/dk/ros2_repos/ROS2/assets/cell035/grids/random_train_like_seed20260513_true_grid.npy}"
+CHECKPOINT="${CHECKPOINT:-$DRL_REPO/deploy_checkpoints/A_full_method_last.pt}"
+TRUE_GRID="${TRUE_GRID:-$ROS_REPO/assets/cell035/grids/random_train_like_seed20260513_true_grid.npy}"
 SCAN_BRIDGE_MODE="${SCAN_BRIDGE_MODE:-ray_project}"
 
 CELL_SIZE="${CELL_SIZE:-0.35}"

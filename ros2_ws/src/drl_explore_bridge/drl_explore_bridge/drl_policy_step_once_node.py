@@ -16,7 +16,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import LaserScan
 
 
-DRL_REPO = Path("/home/dk/drl_repos/DRL-path-finding")
+DRL_REPO = Path.home() / "drl_repos" / "DRL-path-finding"
 if str(DRL_REPO) not in sys.path:
     sys.path.insert(0, str(DRL_REPO))
 
@@ -67,11 +67,11 @@ class DrlPolicyStepOnceNode(Node):
         self.declare_parameter("scan_radius_cells", 10)
         self.declare_parameter("laser_yaw_in_base", math.pi)
         self.declare_parameter("scan_bridge_mode", "ray_project")
-        self.declare_parameter("oracle_los_training_repo", "/home/dk/drl_repos/DRL-path-finding")
+        self.declare_parameter("oracle_los_training_repo", str(DRL_REPO))
         self.declare_parameter("los_beam_window", 1)
         self.declare_parameter("los_obstacle_tolerance", 0.55)
         self.declare_parameter("true_grid_path", "tmp_drl_grids/aligned_10x15_rooms_true_grid.npy")
-        self.declare_parameter("checkpoint_path", "/home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/best.pt")
+        self.declare_parameter("checkpoint_path", str(DRL_REPO / "deploy_checkpoints" / "best.pt"))
 
         self.declare_parameter("rotate_kp", 2.0)
         self.declare_parameter("rotate_max_w", 2.0)

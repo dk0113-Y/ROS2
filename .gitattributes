@@ -1,0 +1,13 @@
+* text=auto
+
+*.md text eol=lf
+*.py text eol=lf
+*.xml text eol=lf
+*.cfg text eol=lf
+*.sh text eol=lf
+*.urdf text eol=lf
+*.world text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+
+*.npy binary

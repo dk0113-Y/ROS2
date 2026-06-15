@@ -64,10 +64,13 @@ output: /map
 1. Export the oracle/ideal trajectory from DRL-path-finding:
 
 ```bash
-cd /home/dk/drl_repos/DRL-path-finding
+export ROS_REPO="$HOME/ROS2"
+export DRL_REPO="$HOME/drl_repos/DRL-path-finding"
+
+cd "$DRL_REPO"
 python scripts/export_oracle_cell035_trajectory.py \
-  --checkpoint /home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/A_full_method_last.pt \
-  --true-grid /home/dk/ros2_repos/ROS2/assets/cell035/grids/random_train_like_seed20260513_true_grid.npy \
+  --checkpoint "$DRL_REPO/deploy_checkpoints/A_full_method_last.pt" \
+  --true-grid "$ROS_REPO/assets/cell035/grids/random_train_like_seed20260513_true_grid.npy" \
   --start-rc 20 36 \
   --cell-size 0.35 \
   --rows 40 \
@@ -77,13 +80,13 @@ python scripts/export_oracle_cell035_trajectory.py \
   --scan-radius-cells 10 \
   --coverage-goal 0.95 \
   --max-steps 400 \
-  --output-dir /home/dk/ros2_repos/ROS2/assets/cell035/trajectories
+  --output-dir "$ROS_REPO/assets/cell035/trajectories"
 ```
 
 2. Confirm the CSV exists:
 
 ```bash
-ls -lh /home/dk/ros2_repos/ROS2/assets/cell035/trajectories/cell035_oracle_trajectory.csv
+ls -lh "$ROS_REPO/assets/cell035/trajectories/cell035_oracle_trajectory.csv"
 ```
 
 3. Start the Gazebo world and robot. Confirm the robot has `/odom`, `/scan`,
@@ -101,7 +104,7 @@ ros2 topic hz /scan
 5. Run trajectory replay:
 
 ```bash
-cd /home/dk/ros2_repos/ROS2
+cd "$ROS_REPO"
 bash scripts/run_cell035_trajectory_replay.sh 2>&1 | tee trajectory_replay_cell035.log
 ```
 
@@ -148,8 +151,8 @@ is skipped and logged as `skipped_initial_waypoint`.
 Default runtime outputs:
 
 ```text
-/home/dk/ros2_repos/ROS2/trajectory_replay_summary.json
-/home/dk/ros2_repos/ROS2/trajectory_replay_log.csv
+$ROS_REPO/trajectory_replay_summary.json
+$ROS_REPO/trajectory_replay_log.csv
 ```
 
 These are runtime artifacts and should not be committed by default.

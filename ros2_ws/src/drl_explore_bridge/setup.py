@@ -13,10 +13,10 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='dk',
-    maintainer_email='2731967162@qq.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer='portfolio maintainer',
+    maintainer_email='maintainer@example.com',
+    description='ROS2/Gazebo bridge and diagnostics for DRL autonomous exploration simulation.',
+    license='LicenseRef-Research-Portfolio',
     extras_require={
         'test': [
             'pytest',

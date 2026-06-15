@@ -13,7 +13,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
 
-DRL_REPO = Path("/home/dk/drl_repos/DRL-path-finding")
+DRL_REPO = Path.home() / "drl_repos" / "DRL-path-finding"
 if str(DRL_REPO) not in sys.path:
     sys.path.insert(0, str(DRL_REPO))
 
@@ -44,7 +44,7 @@ class DrlPolicyProbeNode(Node):
         self.declare_parameter("scan_radius_cells", 10)
         self.declare_parameter("laser_yaw_in_base", math.pi)
         self.declare_parameter("true_grid_path", "tmp_drl_grids/aligned_10x15_rooms_true_grid.npy")
-        self.declare_parameter("checkpoint_path", "/home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/best.pt")
+        self.declare_parameter("checkpoint_path", str(DRL_REPO / "deploy_checkpoints" / "best.pt"))
         self.declare_parameter("print_period_sec", 1.0)
 
         self.cell_size = float(self.get_parameter("cell_size").value)

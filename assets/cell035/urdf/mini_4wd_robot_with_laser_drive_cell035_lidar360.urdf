@@ -8,7 +8,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/base_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/base_link.STL" />
       </geometry>
       <material name="">
         <color rgba="0.741176470588235 0.901960784313726 0.956862745098039 1" />
@@ -17,7 +17,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/base_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -30,7 +30,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lf_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lf_wheel_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -39,7 +39,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lf_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lf_wheel_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -58,7 +58,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lb_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lb_wheel_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -67,7 +67,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lb_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/lb_wheel_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -86,7 +86,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rb_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rb_wheel_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -95,7 +95,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rb_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rb_wheel_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -114,7 +114,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rf_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rf_wheel_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -123,7 +123,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rf_wheel_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/rf_wheel_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -142,7 +142,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/laser.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/laser.STL" />
       </geometry>
       <material name="">
         <color rgba="0.376470588235294 0.376470588235294 0.376470588235294 1" />
@@ -151,7 +151,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/laser.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/laser.STL" />
       </geometry>
     </collision>
   </link>
@@ -170,7 +170,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/controller_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/controller_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -179,7 +179,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/controller_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/controller_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -198,7 +198,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/camera_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/camera_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -207,7 +207,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="file:///home/dk/wheeltec_ros2_ws/src/wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/camera_link.STL" />
+        <mesh filename="package://wheeltec_robot_urdf/wheeltec_robot_urdf/meshes/mini_4wd_robot_meshes/camera_link.STL" />
       </geometry>
     </collision>
   </link>
