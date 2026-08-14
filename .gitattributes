@@ -9,5 +9,9 @@
 *.world text eol=lf
 *.json text eol=lf
 *.txt text eol=lf
+*.csv text eol=lf
+*.yaml text eol=lf
 
 *.npy binary
+*.pgm binary
+*.png binary

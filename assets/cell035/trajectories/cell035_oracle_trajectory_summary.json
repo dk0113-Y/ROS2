@@ -1,0 +1,50 @@
+{
+  "schema_version": "oracle_cell035_trajectory_export/v1",
+  "route_name": "oracle-planned trajectory replay with SLAM mapping",
+  "stop_reason": "coverage_goal",
+  "steps": 205,
+  "best_coverage": 0.9509,
+  "final_coverage": 0.9509,
+  "start_rc": [
+    20,
+    36
+  ],
+  "final_rc": [
+    2,
+    19
+  ],
+  "trajectory_csv": "/home/dk/ros2_repos/ROS2/assets/cell035/trajectories/cell035_oracle_trajectory.csv",
+  "summary_json": "/home/dk/ros2_repos/ROS2/assets/cell035/trajectories/cell035_oracle_trajectory_summary.json",
+  "checkpoint_path": "/home/dk/drl_repos/DRL-path-finding/deploy_checkpoints/A_full_method_last.pt",
+  "true_grid_path": "/home/dk/ros2_repos/ROS2/assets/cell035/grids/random_train_like_seed20260513_true_grid.npy",
+  "cell_size": 0.35,
+  "rows": 40,
+  "cols": 60,
+  "world_x": 21.0,
+  "world_y": 14.0,
+  "scan_radius_cells": 10,
+  "coverage_goal": 0.95,
+  "max_steps": 400,
+  "recent_traj_limit": 64,
+  "final_valid_actions": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "final_q_values": [
+    -13.030214309692383,
+    -13.220646858215332,
+    -13.247852325439453,
+    -12.853437423706055,
+    -3.5572900772094727,
+    14.540924072265625,
+    14.705709457397461,
+    14.250438690185547
+  ],
+  "note": "This export uses oracle/ideal training-side observations. It is not closed-loop LaserScan-conditioned DRL exploration."
+}

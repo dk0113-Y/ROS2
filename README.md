@@ -60,7 +60,7 @@ exported trajectory CSV + /odom
 .
 |-- assets/cell035/
 |   |-- grids/                        # cell035 true grid 与 metadata
-|   |-- trajectories/                 # 导出的 trajectory CSV 占位目录
+|   |-- trajectories/                 # 导出的 oracle trajectory 与摘要
 |   |-- urdf/                         # mini 4WD robot URDF
 |   `-- worlds/                       # Gazebo world
 |-- docs/
@@ -79,6 +79,10 @@ exported trajectory CSV + /odom
     |-- run_cell035_local_snap_diagnostic.sh
     |-- run_cell035_scan_template_los_diagnostic.sh
     `-- run_cell035_trajectory_replay.sh
+
+# 仓库根目录另保留一组经过筛选的 SLAM 可视化资产：
+# cell035_slam_map.pgm/.yaml、map_base_link_trajectory.csv、
+# plot_slam_map_with_map_frame_trajectory_clean.py 和 600x600 PNG。
 ```
 
 ## ROS2 package
@@ -201,7 +205,10 @@ bash scripts/run_cell035_scan_template_los_diagnostic.sh
 assets/cell035/trajectories/cell035_oracle_trajectory.csv
 ```
 
-该 CSV 不在当前仓库中，需从 `DRL-path-finding` 导出后再运行：
+仓库已保留当前 `cell035` 验证使用的 oracle/ideal trajectory 及导出摘要。
+如需更换 checkpoint、地图或起点，应按
+[`docs/trajectory_replay_slam_mapping.md`](docs/trajectory_replay_slam_mapping.md)
+重新导出，再运行：
 
 ```bash
 bash scripts/run_cell035_trajectory_replay.sh
@@ -225,6 +232,23 @@ trajectory_replay_log.csv
 
 详细导出和 SLAM 流程见
 [`docs/trajectory_replay_slam_mapping.md`](docs/trajectory_replay_slam_mapping.md)。
+
+## SLAM 地图与轨迹可视化
+
+仓库根目录保留了当前成功回放对应的精选可视化资产：
+
+- `cell035_slam_map.pgm` / `cell035_slam_map.yaml`：SLAM 栅格地图与元数据。
+- `map_base_link_trajectory.csv`：从 `map` 到 `base_link` 采样的实际轨迹。
+- `cell035_slam_map_with_map_frame_trajectory_clean_600x600.png`：无标题、图例和坐标轴的 600×600 成品。
+- `plot_slam_map_with_map_frame_trajectory_clean.py`：成品的可重复生成脚本。
+
+重新生成：
+
+```bash
+python3 plot_slam_map_with_map_frame_trajectory_clean.py
+```
+
+方形画布使用地图未知区域的灰色补齐上下空间，从而保持地图和轨迹的几何比例，不做拉伸。
 
 ## 已记录实验
 
@@ -284,4 +308,7 @@ trajectory_replay_log.csv
 - SLAM maps
 - Gazebo/ROS bag 大文件
 
-若公开实验产物，应同时保留 world、URDF、checkpoint provenance、参数、topic 配置和日志解释边界。
+本仓库仅对当前 `cell035` 成功回放所需的 oracle trajectory，以及重建
+600×600 地图轨迹图所需的地图和轨迹数据作了精选例外。其他运行日志、重复图片和临时实验输出仍保持本地。
+
+若公开其他实验产物，应同时保留 world、URDF、checkpoint provenance、参数、topic 配置和日志解释边界。

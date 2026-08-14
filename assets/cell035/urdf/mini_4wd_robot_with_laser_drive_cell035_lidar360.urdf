@@ -222,11 +222,11 @@
     <sensor name="laser_scan_sensor" type="ray">
       <always_on>true</always_on>
       <visualize>true</visualize>
-      <update_rate>10</update_rate>
+      <update_rate>12</update_rate>
       <ray>
         <scan>
           <horizontal>
-            <samples>360</samples>
+            <samples>450</samples>
             <resolution>1</resolution>
             <min_angle>-3.141592653589793</min_angle>
             <max_angle>3.141592653589793</max_angle>

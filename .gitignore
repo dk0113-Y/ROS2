@@ -29,3 +29,15 @@ __pycache__/
 # Temporary generated files
 tmp/
 tmp_*/
+
+# Runtime logs and uncurated experiment outputs
+*.log
+*.bak
+trajectory_replay_summary.json
+trajectory_replay_log.csv
+local_log_backup_*/
+experiments/cell035_bridge_diagnostics_*/
+
+# Superseded local visualization drafts
+cell035_slam_map_with_actual_replay_trajectory*.png
+cell035_slam_map_with_map_frame_trajectory.png
