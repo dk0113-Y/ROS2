@@ -7,6 +7,54 @@
 
 本目录及 `drl_explore_bridge` 中以 `realcar_` 开头的节点属于实机迁移实验范围。实机整理不改变 Gazebo 环境、URDF、仿真逻辑或训练算法。
 
+## 实机基础 bringup
+
+本机 Wheeltec 工作空间已经提供底盘、雷达和 TF 子 launch。原有的 `wheeltec_sensors.launch.py` 还会启动相机，原有的 `turn_on_wheeltec_robot.launch.py` 则依赖当前系统未安装的 `joint_state_publisher`。仓库因此提供最小组合入口，只复用官方子 launch，不复制驱动实现：
+
+```bash
+export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
+source scripts_realcar/realcar_env.sh
+setup_realcar_environment
+ros2 launch drl_explore_bridge bringup_realcar.launch.py
+```
+
+该 launch 只启动：
+
+- `/wheeltec_robot` 底盘节点（可执行文件 `wheeltec_robot_node`）；
+- `ekf_filter_node` 里程计滤波及动态 TF；
+- `robot_state_publisher` 和 Wheeltec 已有 static transform publishers；
+- 当前配置对应的雷达驱动。
+
+不会启动 DRL、Nav2、exploration、相机或任何 `/cmd_vel` publisher。
+
+当前 `/home/wheeltec/wheeltec_ros2_ws/src/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的实机配置为 `car_mode: mini_4wd`、`lidar_type: ls_N10Plus_uart`。基础接口预期如下：
+
+| 接口 | 类型 | 来源/使用者 | 坐标系或说明 |
+| --- | --- | --- | --- |
+| `/cmd_vel` | `geometry_msgs/msg/Twist` | `/wheeltec_robot` 订阅 | bringup 不应存在 publisher |
+| `/odom` | `nav_msgs/msg/Odometry` | `/wheeltec_robot` 发布 | `odom_combined` → `base_footprint` |
+| `/scan` | `sensor_msgs/msg/LaserScan` | `/x10/lslidar_driver_node` 发布 | `frame_id: laser`，配置频率 10 Hz |
+
+实机 TF 并不是字面上的 `odom -> base_link -> laser` 单链，而是：
+
+```text
+odom_combined -> base_footprint -> base_link
+                              \-> laser
+```
+
+因此应检查 `odom_combined -> base_link` 和 `base_link -> laser`。`robot_mode_description.launch.py` 已提供 `base_footprint` 到 `base_link`、`laser` 的静态变换，不需要额外添加 `static_transform_publisher`。
+
+bringup 启动后，在另一个终端运行只读检查：
+
+```bash
+export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
+./scripts_realcar/check_realcar_topics.sh
+```
+
+脚本只执行 node/topic/TF 查询和短时频率采样，从不发布 `/cmd_vel`。
+
+本机实际检查证据见 [`BRINGUP_VALIDATION_2026-08-16.md`](BRINGUP_VALIDATION_2026-08-16.md)。
+
 ## 安全边界
 
 - `realcar_policy_dryrun_node` 只订阅 `/scan`、`/odom` 并执行策略推理，不创建 `/cmd_vel` publisher。
