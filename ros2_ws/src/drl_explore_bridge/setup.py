@@ -15,7 +15,10 @@ setup(
     zip_safe=True,
     maintainer='portfolio maintainer',
     maintainer_email='maintainer@example.com',
-    description='ROS2/Gazebo bridge and diagnostics for DRL autonomous exploration simulation.',
+    description=(
+        'ROS2 bridge and diagnostics for DRL exploration simulation and '
+        'real-robot migration.'
+    ),
     license='LicenseRef-Research-Portfolio',
     extras_require={
         'test': [
@@ -29,8 +32,17 @@ setup(
             'drl_policy_probe = drl_explore_bridge.drl_policy_probe_node:main',
             'drl_policy_step_once_node = drl_explore_bridge.drl_policy_step_once_node:main',
             'drl_policy_multi_step_node = drl_explore_bridge.drl_policy_multi_step_node:main',
-            'drl_standalone_gazebo_bridge_node = drl_explore_bridge.drl_standalone_gazebo_bridge_node:main',
+            (
+                'drl_standalone_gazebo_bridge_node = '
+                'drl_explore_bridge.drl_standalone_gazebo_bridge_node:main'
+            ),
             'drl_trajectory_replay_node = drl_explore_bridge.drl_trajectory_replay_node:main',
+            'realcar_policy_dryrun_node = drl_explore_bridge.realcar_policy_dryrun_node:main',
+            'realcar_step_once_safe_node = drl_explore_bridge.realcar_step_once_safe_node:main',
+            (
+                'realcar_policy_safe_runner_node = '
+                'drl_explore_bridge.realcar_policy_safe_runner_node:main'
+            ),
         ],
     },
 )
