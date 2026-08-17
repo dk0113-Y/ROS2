@@ -1190,6 +1190,15 @@ class RealcarPolicySafeRunner(Node):
     def check_drive_dynamic_safety(self) -> None:
         """Provide an opt-in drive-phase safety hook for derived runners."""
 
+    def wait_for_drive_sensor_cycle(
+        self,
+        previous_scan_sequence: int,
+        previous_odom_sequence: int,
+    ) -> None:
+        """Preserve the Round 7 single-spin drive control behavior."""
+        del previous_scan_sequence, previous_odom_sequence
+        rclpy.spin_once(self, timeout_sec=0.05)
+
     def execute_target(self, target: ActionExecutionTarget) -> float:
         x0, y0, _yaw0, _ = self.pose_xy_yaw_time()
         target_dist = math.hypot(target.target_x - x0, target.target_y - y0)
@@ -1270,9 +1279,16 @@ class RealcarPolicySafeRunner(Node):
         )
         drive_wall_start = time.monotonic()
         last_debug = -1.0e9
+        previous_scan_sequence = self.scan_sequence
+        previous_odom_sequence = self.odom_sequence
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.wait_for_drive_sensor_cycle(
+                previous_scan_sequence,
+                previous_odom_sequence,
+            )
+            previous_scan_sequence = self.scan_sequence
+            previous_odom_sequence = self.odom_sequence
             x, y, yaw, _ = self.pose_xy_yaw_time()
             dist = math.hypot(target.target_x - x, target.target_y - y)
             wall_elapsed = time.monotonic() - drive_wall_start

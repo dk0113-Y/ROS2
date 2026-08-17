@@ -43,6 +43,10 @@ class DynamicObstacleStop(RuntimeError):
     """Signal that a fresh drive-phase scan requires an immediate stop."""
 
 
+class DriveSensorCycleTimeout(RuntimeError):
+    """Signal that scan and odom did not both advance before the watchdog."""
+
+
 @dataclass(frozen=True)
 class ContinuousPreMotionPlan:
     """Describe the final action and distance-aware pre-motion gate result."""
@@ -100,6 +104,18 @@ def dynamic_obstacle_should_stop(
         or not math.isfinite(observed_clearance)
         or observed_clearance < emergency_stop_distance
     )
+
+
+def drive_sensor_sequence_progress(
+    scan_sequence: int,
+    odom_sequence: int,
+    previous_scan_sequence: int,
+    previous_odom_sequence: int,
+) -> tuple[bool, bool, bool]:
+    """Report whether scan, odom, and the complete drive pair advanced."""
+    scan_advanced = scan_sequence > previous_scan_sequence
+    odom_advanced = odom_sequence > previous_odom_sequence
+    return scan_advanced, odom_advanced, scan_advanced and odom_advanced
 
 
 def belief_statistics(cum_map: Any) -> tuple[int, int]:
@@ -287,6 +303,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.declare_parameter("deadlock_maximum_unique_states", 2)
         self.declare_parameter("deadlock_min_known_growth", 1)
         self.declare_parameter("no_safe_action_retries", 0)
+        self.declare_parameter("drive_sensor_cycle_timeout_sec", 0.25)
         self.declare_parameter("commissioning_mode", False)
         self.declare_parameter("commissioning_action_idx", -1)
         self.declare_parameter(
@@ -326,6 +343,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         )
         self.no_safe_action_retries = int(
             self.get_parameter("no_safe_action_retries").value
+        )
+        self.drive_sensor_cycle_timeout_sec = float(
+            self.get_parameter("drive_sensor_cycle_timeout_sec").value
         )
         self.commissioning_mode = bool(
             self.get_parameter("commissioning_mode").value
@@ -387,6 +407,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             },
             "motion_clearance_margin": self.motion_clearance_margin,
             "dynamic_stop_distance": self.dynamic_stop_distance,
+            "drive_sensor_cycle_timeout_sec": (
+                self.drive_sensor_cycle_timeout_sec
+            ),
             "total_steps": 0,
             "successful_steps": 0,
             "travel_distance": 0.0,
@@ -404,6 +427,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"motion_clearance_margin={self.motion_clearance_margin:.3f} "
             "margin_status=unvalidated_engineering_safety_margin "
             f"dynamic_stop_distance={self.dynamic_stop_distance:.3f} "
+            "drive_sensor_cycle_timeout_sec="
+            f"{self.drive_sensor_cycle_timeout_sec:.3f} "
+            "drive_sensor_watchdog_status=engineering_watchdog "
             f"commissioning_mode={self.commissioning_mode} "
             f"commissioning_action_idx={self.commissioning_action_idx} "
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
@@ -454,6 +480,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError("deadlock_min_known_growth must be >= 0")
         if self.no_safe_action_retries < 0:
             raise ValueError("no_safe_action_retries must be >= 0")
+        if self.drive_sensor_cycle_timeout_sec <= 0.0:
+            raise ValueError("drive_sensor_cycle_timeout_sec must be > 0")
         validate_commissioning_config(
             self.commissioning_mode,
             self.max_steps,
@@ -606,6 +634,107 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 f"< threshold={self.dynamic_stop_distance:.3f}m"
             )
 
+    @staticmethod
+    def _maximum_optional_age(
+        current: Optional[float],
+        sample: Optional[float],
+    ) -> Optional[float]:
+        """Accumulate a maximum sensor age while preserving missing values."""
+        if sample is None:
+            return current
+        if current is None:
+            return sample
+        return max(current, sample)
+
+    def _record_drive_sensor_cycle(
+        self,
+        wait_duration: float,
+        scan_advanced: bool,
+        odom_advanced: bool,
+        timed_out: bool,
+    ) -> None:
+        """Update compact drive-cycle sequence, wait, and age diagnostics."""
+        record = self._dynamic_step_record
+        if record is None:
+            return
+        ages = self.sensor_age_diagnostics()
+        record["drive_sensor_cycle_count"] += 1
+        record["drive_sensor_cycle_max_wait_sec"] = max(
+            record["drive_sensor_cycle_max_wait_sec"],
+            wait_duration,
+        )
+        record["drive_sensor_cycle_scan_advanced"] = scan_advanced
+        record["drive_sensor_cycle_odom_advanced"] = odom_advanced
+        record["drive_sensor_cycle_timeout"] = timed_out
+        for source_key, target_key in (
+            ("scan_receive_age_sec", "drive_max_scan_receive_age_sec"),
+            ("scan_header_age_sec", "drive_max_scan_header_age_sec"),
+            ("odom_receive_age_sec", "drive_max_odom_receive_age_sec"),
+            ("odom_header_age_sec", "drive_max_odom_header_age_sec"),
+        ):
+            record[target_key] = self._maximum_optional_age(
+                record[target_key],
+                ages[source_key],
+            )
+
+    def spin_drive_sensor_once(self, timeout_sec: float) -> None:
+        """Spin one bounded callback interval for the drive sensor barrier."""
+        rclpy.spin_once(self, timeout_sec=timeout_sec)
+
+    def drive_sensor_cycle_active(self) -> bool:
+        """Return whether the ROS context can continue the bounded wait."""
+        return rclpy.ok()
+
+    def wait_for_drive_sensor_cycle(
+        self,
+        previous_scan_sequence: int,
+        previous_odom_sequence: int,
+    ) -> None:
+        """Require a fresh scan/odom pair before the next drive command."""
+        started = time.monotonic()
+        deadline = started + self.drive_sensor_cycle_timeout_sec
+        scan_advanced = False
+        odom_advanced = False
+
+        while self.drive_sensor_cycle_active() and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            self.spin_drive_sensor_once(min(0.05, max(0.0, remaining)))
+            scan_advanced, odom_advanced, pair_advanced = (
+                drive_sensor_sequence_progress(
+                    self.scan_sequence,
+                    self.odom_sequence,
+                    previous_scan_sequence,
+                    previous_odom_sequence,
+                )
+            )
+            if pair_advanced:
+                self._record_drive_sensor_cycle(
+                    time.monotonic() - started,
+                    scan_advanced,
+                    odom_advanced,
+                    False,
+                )
+                self.require_fresh_inputs()
+                self.check_drive_dynamic_safety()
+                return
+
+        wait_duration = time.monotonic() - started
+        self._record_drive_sensor_cycle(
+            wait_duration,
+            scan_advanced,
+            odom_advanced,
+            True,
+        )
+        diagnostics = self.sensor_age_diagnostics()
+        self.stop(repeat=3)
+        raise DriveSensorCycleTimeout(
+            "drive_sensor_cycle_timeout: "
+            f"wait={wait_duration:.3f}s "
+            f"scan_advanced={scan_advanced} "
+            f"odom_advanced={odom_advanced}; "
+            f"{self.format_sensor_age_diagnostics(diagnostics)}"
+        )
+
     def begin_step_record(self, step_id: int) -> tuple[dict[str, Any], float]:
         """Create a compact continuous-decision JSON record."""
         record, started = super().begin_step_record(step_id)
@@ -631,6 +760,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "grid_transition_match": None,
                 "dynamic_obstacle_stop": False,
                 "dynamic_observed_clearance": None,
+                "drive_sensor_cycle_timeout_sec": (
+                    self.drive_sensor_cycle_timeout_sec
+                ),
+                "drive_sensor_cycle_count": 0,
+                "drive_sensor_cycle_max_wait_sec": 0.0,
+                "drive_sensor_cycle_scan_advanced": None,
+                "drive_sensor_cycle_odom_advanced": None,
+                "drive_sensor_cycle_timeout": False,
+                "drive_max_scan_receive_age_sec": None,
+                "drive_max_scan_header_age_sec": None,
+                "drive_max_odom_receive_age_sec": None,
+                "drive_max_odom_header_age_sec": None,
                 "step_success": False,
                 "commissioning_mode": self.commissioning_mode,
                 "commissioning_action_idx": self.commissioning_action_idx,
@@ -783,6 +924,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"gate_passed={record['gate_passed']} "
             f"grid_transition_match={record['grid_transition_match']} "
             f"dynamic_obstacle_stop={record['dynamic_obstacle_stop']} "
+            "drive_sensor_cycle_count="
+            f"{record['drive_sensor_cycle_count']} "
+            "drive_sensor_cycle_max_wait_sec="
+            f"{record['drive_sensor_cycle_max_wait_sec']:.3f} "
+            "drive_sensor_cycle_timeout="
+            f"{record['drive_sensor_cycle_timeout']} "
+            "drive_sensor_cycle_scan_advanced="
+            f"{record['drive_sensor_cycle_scan_advanced']} "
+            "drive_sensor_cycle_odom_advanced="
+            f"{record['drive_sensor_cycle_odom_advanced']} "
+            "drive_max_scan_receive_age_sec="
+            f"{format_optional_float(record['drive_max_scan_receive_age_sec'])} "
+            "drive_max_scan_header_age_sec="
+            f"{format_optional_float(record['drive_max_scan_header_age_sec'])} "
+            "drive_max_odom_receive_age_sec="
+            f"{format_optional_float(record['drive_max_odom_receive_age_sec'])} "
+            "drive_max_odom_header_age_sec="
+            f"{format_optional_float(record['drive_max_odom_header_age_sec'])} "
             f"step_success={record['step_success']} "
             f"failure_reason={record['failure_reason']}"
         )
@@ -1059,6 +1218,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self._log_continuous_step(record)
                 self.get_logger().error(str(exc))
                 return "dynamic_obstacle_stop"
+            except DriveSensorCycleTimeout as exc:
+                self.stop()
+                record.update(self.sensor_age_diagnostics())
+                self.finish_step_record(
+                    record,
+                    step_started,
+                    False,
+                    "drive_sensor_cycle_timeout",
+                )
+                self._log_continuous_step(record)
+                self.get_logger().error(str(exc))
+                return "drive_sensor_cycle_timeout"
             except Exception as exc:
                 self.stop()
                 record.update(self.sensor_age_diagnostics())

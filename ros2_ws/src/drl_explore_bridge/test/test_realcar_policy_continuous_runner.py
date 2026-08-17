@@ -12,12 +12,14 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     CONTINUOUS_CELL_SIZE_M,
     CONTINUOUS_DEFAULT_MAX_STEPS,
     ContinuousPreMotionPlan,
+    DriveSensorCycleTimeout,
     DynamicObstacleStop,
     RealcarPolicyContinuousRunner,
     action_source_for_mode,
     belief_statistics,
     clearance_gate_passed,
     dynamic_obstacle_should_stop,
+    drive_sensor_sequence_progress,
     episode_success_for_reason,
     expected_grid_state_from_action,
     frontier_exhausted,
@@ -132,6 +134,90 @@ class DynamicHarness:
 
     def stop(self, repeat=10):
         """Record the zero-command stop request."""
+        del repeat
+        self.stop_calls += 1
+
+
+class DriveCycleHarness:
+    """Exercise the continuous drive sensor barrier without a ROS executor."""
+
+    def __init__(self, advance_scan=False, advance_odom=False, stale=False):
+        self.scan_sequence = 10
+        self.odom_sequence = 20
+        self.advance_scan = advance_scan
+        self.advance_odom = advance_odom
+        self.stale = stale
+        self.drive_sensor_cycle_timeout_sec = 0.002
+        self.stop_calls = 0
+        self.freshness_checks = 0
+        self.dynamic_checks = 0
+        self._dynamic_step_record = {
+            "drive_sensor_cycle_count": 0,
+            "drive_sensor_cycle_max_wait_sec": 0.0,
+            "drive_sensor_cycle_scan_advanced": None,
+            "drive_sensor_cycle_odom_advanced": None,
+            "drive_sensor_cycle_timeout": False,
+            "drive_max_scan_receive_age_sec": None,
+            "drive_max_scan_header_age_sec": None,
+            "drive_max_odom_receive_age_sec": None,
+            "drive_max_odom_header_age_sec": None,
+        }
+
+    def drive_sensor_cycle_active(self):
+        """Keep the deterministic short watchdog active."""
+        return True
+
+    def spin_drive_sensor_once(self, timeout_sec):
+        """Advance only the sensor callbacks selected by the test."""
+        del timeout_sec
+        if self.advance_scan:
+            self.scan_sequence += 1
+            self.advance_scan = False
+        if self.advance_odom:
+            self.odom_sequence += 1
+            self.advance_odom = False
+
+    def require_fresh_inputs(self):
+        """Model the existing header freshness gate."""
+        self.freshness_checks += 1
+        if self.stale:
+            raise RuntimeError("/scan timestamp is stale")
+
+    def check_drive_dynamic_safety(self):
+        """Record that dynamic safety runs after freshness."""
+        self.dynamic_checks += 1
+
+    def sensor_age_diagnostics(self):
+        """Return compact deterministic age diagnostics."""
+        return {
+            "scan_sequence": self.scan_sequence,
+            "odom_sequence": self.odom_sequence,
+            "scan_receive_age_sec": 0.10,
+            "scan_header_age_sec": 0.12,
+            "odom_receive_age_sec": 0.08,
+            "odom_header_age_sec": 0.09,
+        }
+
+    def _maximum_optional_age(self, current, sample):
+        """Reuse the production maximum-age accumulator."""
+        return RealcarPolicyContinuousRunner._maximum_optional_age(
+            current,
+            sample,
+        )
+
+    def _record_drive_sensor_cycle(self, *args):
+        """Reuse production diagnostic recording."""
+        return RealcarPolicyContinuousRunner._record_drive_sensor_cycle(
+            self,
+            *args,
+        )
+
+    def format_sensor_age_diagnostics(self, diagnostics):
+        """Provide a concise timeout diagnostic for assertions."""
+        return str(diagnostics)
+
+    def stop(self, repeat=10):
+        """Record the immediate zero-velocity request."""
         del repeat
         self.stop_calls += 1
 
@@ -415,6 +501,100 @@ def test_drive_dynamic_gate_stops_before_motion_can_continue():
         RealcarPolicyContinuousRunner.check_drive_dynamic_safety(harness)
     assert harness.stop_calls == 1
     assert harness._dynamic_step_record["dynamic_obstacle_stop"]
+
+
+def test_drive_cycle_with_only_odom_update_cannot_continue():
+    harness = DriveCycleHarness(advance_odom=True)
+    with pytest.raises(DriveSensorCycleTimeout):
+        RealcarPolicyContinuousRunner.wait_for_drive_sensor_cycle(
+            harness,
+            10,
+            20,
+        )
+    assert harness.stop_calls == 1
+    assert not harness._dynamic_step_record["drive_sensor_cycle_scan_advanced"]
+    assert harness._dynamic_step_record["drive_sensor_cycle_odom_advanced"]
+
+
+def test_drive_cycle_with_only_scan_update_cannot_continue():
+    harness = DriveCycleHarness(advance_scan=True)
+    with pytest.raises(DriveSensorCycleTimeout):
+        RealcarPolicyContinuousRunner.wait_for_drive_sensor_cycle(
+            harness,
+            10,
+            20,
+        )
+    assert harness.stop_calls == 1
+    assert harness._dynamic_step_record["drive_sensor_cycle_scan_advanced"]
+    assert not harness._dynamic_step_record["drive_sensor_cycle_odom_advanced"]
+
+
+def test_drive_cycle_with_fresh_scan_and_odom_can_continue():
+    harness = DriveCycleHarness(advance_scan=True, advance_odom=True)
+    RealcarPolicyContinuousRunner.wait_for_drive_sensor_cycle(
+        harness,
+        10,
+        20,
+    )
+    assert harness.freshness_checks == 1
+    assert harness.dynamic_checks == 1
+    assert harness.stop_calls == 0
+    assert harness._dynamic_step_record["drive_sensor_cycle_scan_advanced"]
+    assert harness._dynamic_step_record["drive_sensor_cycle_odom_advanced"]
+
+
+def test_drive_sensor_cycle_timeout_stops_and_records_abort_diagnostic():
+    harness = DriveCycleHarness()
+    with pytest.raises(
+        DriveSensorCycleTimeout,
+        match="drive_sensor_cycle_timeout",
+    ):
+        RealcarPolicyContinuousRunner.wait_for_drive_sensor_cycle(
+            harness,
+            10,
+            20,
+        )
+    assert harness.stop_calls == 1
+    assert harness._dynamic_step_record["drive_sensor_cycle_timeout"]
+    assert harness._dynamic_step_record["drive_sensor_cycle_count"] == 1
+
+
+def test_drive_cycle_stale_header_blocks_before_dynamic_safety():
+    harness = DriveCycleHarness(
+        advance_scan=True,
+        advance_odom=True,
+        stale=True,
+    )
+    with pytest.raises(RuntimeError, match="timestamp is stale"):
+        RealcarPolicyContinuousRunner.wait_for_drive_sensor_cycle(
+            harness,
+            10,
+            20,
+        )
+    assert harness.freshness_checks == 1
+    assert harness.dynamic_checks == 0
+    assert harness._dynamic_step_record["drive_max_scan_header_age_sec"] == 0.12
+
+
+@pytest.mark.parametrize(
+    ("scan_sequence", "odom_sequence", "expected"),
+    (
+        (11, 20, (True, False, False)),
+        (10, 21, (False, True, False)),
+        (11, 21, (True, True, True)),
+    ),
+)
+def test_drive_sensor_pair_requires_both_sequences(
+    scan_sequence,
+    odom_sequence,
+    expected,
+):
+    assert drive_sensor_sequence_progress(
+        scan_sequence,
+        odom_sequence,
+        10,
+        20,
+    ) == expected
 
 
 def test_post_inference_barrier_requires_new_scan_and_odom():
