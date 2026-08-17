@@ -5,9 +5,10 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import rclpy
@@ -15,6 +16,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile
 from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_action_adapter import (
@@ -27,6 +29,10 @@ DEFAULT_CHECKPOINT = os.environ.get("DRL_CHECKPOINT_PATH", "")
 MAX_LINEAR_SPEED = 0.06
 MAX_ANGULAR_SPEED = 0.40
 MAX_SAFE_STEPS = 3
+LATEST_SENSOR_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
 
 ACTIONS_8 = (
     (-1, 0),    # 0 N: left
@@ -63,6 +69,126 @@ DIAGNOSTIC_SECTORS = {
 INVISIBLE = -1
 EMPTY = 0
 OBSTACLE = 1
+
+
+@dataclass(frozen=True)
+class SensorRefreshBarrier:
+    scan_sequence: int
+    odom_sequence: int
+    started_monotonic: float
+
+
+@dataclass(frozen=True)
+class PreMotionActionSelection:
+    raw_policy_action: int
+    executed_action: Optional[int]
+    action_filter_passed: bool
+    lidar_gate_passed: bool
+    observed_min_dist: Optional[float]
+    selected_sector_min: Optional[float]
+    safety_fallback_used: bool
+
+
+def sensor_sample_is_after_barrier(
+    sequence: int,
+    received_at: Optional[float],
+    barrier_sequence: int,
+    barrier_monotonic: float,
+) -> bool:
+    return (
+        sequence > barrier_sequence
+        and received_at is not None
+        and received_at > barrier_monotonic
+    )
+
+
+def sensor_freshness_error(
+    name: str,
+    stamp_sec: Optional[float],
+    received_at: Optional[float],
+    now_monotonic: float,
+    now_ros_sec: float,
+    timeout_sec: float,
+    future_tolerance_sec: float,
+) -> Optional[str]:
+    if stamp_sec is None or received_at is None:
+        return f"missing {name} data"
+
+    receive_age = now_monotonic - received_at
+    if receive_age > timeout_sec:
+        return (
+            f"{name} stopped updating: receive_age={receive_age:.3f}s "
+            f"> timeout={timeout_sec:.3f}s"
+        )
+    if stamp_sec <= 0.0:
+        return f"{name} has an invalid zero timestamp"
+
+    stamp_age = now_ros_sec - stamp_sec
+    if stamp_age > timeout_sec:
+        return (
+            f"{name} timestamp is stale: age={stamp_age:.3f}s "
+            f"> timeout={timeout_sec:.3f}s"
+        )
+    if stamp_age < -future_tolerance_sec:
+        return f"{name} timestamp is in the future: age={stamp_age:.3f}s"
+    return None
+
+
+def select_pre_motion_action(
+    raw_policy_action: int,
+    q_ranked: list[tuple[int, float]],
+    allowed_actions: set[int],
+    allow_lidar_fallback: bool,
+    evaluate_lidar: Callable[[int], tuple[bool, Optional[float]]],
+) -> PreMotionActionSelection:
+    if raw_policy_action not in allowed_actions:
+        return PreMotionActionSelection(
+            raw_policy_action=raw_policy_action,
+            executed_action=None,
+            action_filter_passed=False,
+            lidar_gate_passed=False,
+            observed_min_dist=None,
+            selected_sector_min=None,
+            safety_fallback_used=False,
+        )
+
+    raw_passed, raw_sector_min = evaluate_lidar(raw_policy_action)
+    if raw_passed:
+        return PreMotionActionSelection(
+            raw_policy_action=raw_policy_action,
+            executed_action=raw_policy_action,
+            action_filter_passed=True,
+            lidar_gate_passed=True,
+            observed_min_dist=raw_sector_min,
+            selected_sector_min=raw_sector_min,
+            safety_fallback_used=False,
+        )
+
+    if allow_lidar_fallback:
+        for action_idx, _q_value in q_ranked:
+            if action_idx not in allowed_actions or action_idx == raw_policy_action:
+                continue
+            passed, sector_min = evaluate_lidar(action_idx)
+            if passed:
+                return PreMotionActionSelection(
+                    raw_policy_action=raw_policy_action,
+                    executed_action=action_idx,
+                    action_filter_passed=True,
+                    lidar_gate_passed=True,
+                    observed_min_dist=raw_sector_min,
+                    selected_sector_min=sector_min,
+                    safety_fallback_used=True,
+                )
+
+    return PreMotionActionSelection(
+        raw_policy_action=raw_policy_action,
+        executed_action=None,
+        action_filter_passed=True,
+        lidar_gate_passed=False,
+        observed_min_dist=raw_sector_min,
+        selected_sector_min=None,
+        safety_fallback_used=False,
+    )
 
 
 def yaw_from_quat(q) -> float:
@@ -309,13 +435,15 @@ class RealcarPolicySafeRunner(Node):
         }
         self.result_write_attempted = False
         self.odom_state_origin: Optional[tuple[float, float]] = None
-        self.last_consumed_scan_received_at: Optional[float] = None
-        self.last_consumed_odom_received_at: Optional[float] = None
+        self.last_consumed_scan_sequence = 0
+        self.last_consumed_odom_sequence = 0
 
         self.latest_scan: Optional[LaserScan] = None
         self.latest_odom: Optional[Odometry] = None
         self.latest_scan_received_at: Optional[float] = None
         self.latest_odom_received_at: Optional[float] = None
+        self.scan_sequence = 0
+        self.odom_sequence = 0
 
         self.sensor_cb_group = MutuallyExclusiveCallbackGroup()
         self.control_cb_group = MutuallyExclusiveCallbackGroup()
@@ -325,14 +453,14 @@ class RealcarPolicySafeRunner(Node):
             LaserScan,
             "/scan",
             self.scan_cb,
-            10,
+            LATEST_SENSOR_QOS,
             callback_group=self.sensor_cb_group,
         )
         self.create_subscription(
             Odometry,
             "/odom",
             self.odom_cb,
-            10,
+            LATEST_SENSOR_QOS,
             callback_group=self.sensor_cb_group,
         )
 
@@ -361,6 +489,7 @@ class RealcarPolicySafeRunner(Node):
             f"laser_yaw_in_base={self.laser_yaw_in_base:.3f} "
             f"scan_timeout_sec={self.scan_timeout_sec:.3f} "
             f"odom_timeout_sec={self.odom_timeout_sec:.3f} "
+            "sensor_qos=KEEP_LAST(depth=1,RELIABLE,VOLATILE) "
             f"result_file_path={self.result_file_path}"
         )
         if not self.step_matches_cell_size:
@@ -466,26 +595,49 @@ class RealcarPolicySafeRunner(Node):
         )
 
     def pose_record(self) -> dict[str, float]:
-        x, y, yaw, odom_timestamp = self.pose_xy_yaw_time()
+        if self.latest_odom is None:
+            raise RuntimeError("latest_odom is None")
+        return self.pose_record_from_odom(self.latest_odom)
+
+    @staticmethod
+    def pose_record_from_odom(odom: Odometry) -> dict[str, float]:
+        p = odom.pose.pose.position
+        q = odom.pose.pose.orientation
+        yaw = yaw_from_quat(q)
         return {
-            "x": x,
-            "y": y,
+            "x": float(p.x),
+            "y": float(p.y),
             "yaw_rad": yaw,
             "yaw_deg": math.degrees(yaw),
-            "odom_timestamp": odom_timestamp,
+            "odom_timestamp": stamp_to_sec(odom.header.stamp),
         }
 
     def begin_step_record(self, step_id: int) -> tuple[dict[str, Any], float]:
         record: dict[str, Any] = {
             "step_id": step_id,
             "action_idx": None,
+            "raw_policy_action": None,
+            "pre_motion_requested_action": None,
+            "pre_motion_executed_action": None,
+            "safety_fallback_used": False,
             "motion_mode": self.motion_mode,
             "executed": self.execute,
+            "observation_pose": None,
             "start_pose": None,
+            "pre_motion_pose": None,
             "target_pose": None,
             "target_direction": None,
             "end_pose": None,
             "actual_distance": None,
+            "policy_state_build_duration_sec": None,
+            "policy_inference_duration_sec": None,
+            "pre_motion_refresh_duration_sec": None,
+            "scan_sequence": None,
+            "odom_sequence": None,
+            "scan_receive_age_sec": None,
+            "scan_header_age_sec": None,
+            "odom_receive_age_sec": None,
+            "odom_header_age_sec": None,
             "success": False,
             "failure_reason": "in_progress",
             "duration": None,
@@ -549,10 +701,63 @@ class RealcarPolicySafeRunner(Node):
     def scan_cb(self, msg: LaserScan) -> None:
         self.latest_scan = msg
         self.latest_scan_received_at = time.monotonic()
+        self.scan_sequence += 1
 
     def odom_cb(self, msg: Odometry) -> None:
         self.latest_odom = msg
         self.latest_odom_received_at = time.monotonic()
+        self.odom_sequence += 1
+
+    def sensor_age_diagnostics(self) -> dict[str, Optional[float] | int]:
+        now_monotonic = time.monotonic()
+        now_ros_sec = self.get_clock().now().nanoseconds * 1e-9
+        scan_stamp = (
+            None
+            if self.latest_scan is None
+            else stamp_to_sec(self.latest_scan.header.stamp)
+        )
+        odom_stamp = (
+            None
+            if self.latest_odom is None
+            else stamp_to_sec(self.latest_odom.header.stamp)
+        )
+        return {
+            "scan_sequence": self.scan_sequence,
+            "odom_sequence": self.odom_sequence,
+            "scan_receive_age_sec": (
+                None
+                if self.latest_scan_received_at is None
+                else now_monotonic - self.latest_scan_received_at
+            ),
+            "scan_header_age_sec": (
+                None if scan_stamp is None else now_ros_sec - scan_stamp
+            ),
+            "odom_receive_age_sec": (
+                None
+                if self.latest_odom_received_at is None
+                else now_monotonic - self.latest_odom_received_at
+            ),
+            "odom_header_age_sec": (
+                None if odom_stamp is None else now_ros_sec - odom_stamp
+            ),
+        }
+
+    @staticmethod
+    def format_sensor_age_diagnostics(
+        diagnostics: dict[str, Optional[float] | int],
+    ) -> str:
+        return (
+            f"scan_sequence={diagnostics['scan_sequence']} "
+            "scan_receive_age_sec="
+            f"{format_optional_float(diagnostics['scan_receive_age_sec'])} "
+            "scan_header_age_sec="
+            f"{format_optional_float(diagnostics['scan_header_age_sec'])} "
+            f"odom_sequence={diagnostics['odom_sequence']} "
+            "odom_receive_age_sec="
+            f"{format_optional_float(diagnostics['odom_receive_age_sec'])} "
+            "odom_header_age_sec="
+            f"{format_optional_float(diagnostics['odom_header_age_sec'])}"
+        )
 
     def require_fresh_sensor(
         self,
@@ -561,30 +766,18 @@ class RealcarPolicySafeRunner(Node):
         received_at: Optional[float],
         timeout_sec: float,
     ) -> None:
-        if msg is None or received_at is None:
-            raise RuntimeError(f"missing {name} data")
-
-        receive_age = time.monotonic() - received_at
-        if receive_age > timeout_sec:
-            raise RuntimeError(
-                f"{name} stopped updating: receive_age={receive_age:.3f}s "
-                f"> timeout={timeout_sec:.3f}s"
-            )
-
-        stamp_sec = stamp_to_sec(msg.header.stamp)
-        if stamp_sec <= 0.0:
-            raise RuntimeError(f"{name} has an invalid zero timestamp")
-
-        stamp_age = self.get_clock().now().nanoseconds * 1e-9 - stamp_sec
-        if stamp_age > timeout_sec:
-            raise RuntimeError(
-                f"{name} timestamp is stale: age={stamp_age:.3f}s "
-                f"> timeout={timeout_sec:.3f}s"
-            )
-        if stamp_age < -self.sensor_future_tolerance_sec:
-            raise RuntimeError(
-                f"{name} timestamp is in the future: age={stamp_age:.3f}s"
-            )
+        stamp_sec = None if msg is None else stamp_to_sec(msg.header.stamp)
+        error = sensor_freshness_error(
+            name=name,
+            stamp_sec=stamp_sec,
+            received_at=received_at,
+            now_monotonic=time.monotonic(),
+            now_ros_sec=self.get_clock().now().nanoseconds * 1e-9,
+            timeout_sec=timeout_sec,
+            future_tolerance_sec=self.sensor_future_tolerance_sec,
+        )
+        if error is not None:
+            raise RuntimeError(error)
 
     def require_fresh_inputs(self) -> None:
         self.require_fresh_sensor(
@@ -774,13 +967,14 @@ class RealcarPolicySafeRunner(Node):
             for name, center_yaw in DIAGNOSTIC_SECTORS.items()
         }
 
-    def action_sector_min(self, action_idx: int, scan: LaserScan) -> Optional[float]:
+    def action_sector_min(
+        self,
+        action_idx: int,
+        scan: LaserScan,
+        odom: Odometry,
+    ) -> Optional[float]:
         half_width = math.radians(22.5)
-        if self.latest_odom is None:
-            raise RuntimeError(
-                "latest_odom is None for action sector transform"
-            )
-        robot_yaw = yaw_from_quat(self.latest_odom.pose.pose.orientation)
+        robot_yaw = yaw_from_quat(odom.pose.pose.orientation)
         direction = self.action_adapter.target_for_action(
             action_idx,
             start_x=0.0,
@@ -790,8 +984,13 @@ class RealcarPolicySafeRunner(Node):
         center_base_yaw = norm_angle(direction.target_yaw - robot_yaw)
         return self.sector_min_dist(scan, center_base_yaw, half_width)
 
-    def lidar_gate(self, action_idx: int, scan: LaserScan) -> tuple[bool, Optional[float]]:
-        action_min = self.action_sector_min(action_idx, scan)
+    def lidar_gate(
+        self,
+        action_idx: int,
+        scan: LaserScan,
+        odom: Odometry,
+    ) -> tuple[bool, Optional[float]]:
+        action_min = self.action_sector_min(action_idx, scan, odom)
         if self.all8_action_mode:
             action_passed = action_min is not None and action_min >= self.min_sector_dist
             return action_passed, action_min
@@ -806,12 +1005,13 @@ class RealcarPolicySafeRunner(Node):
         self,
         q_ranked: list[tuple[int, float]],
         scan: LaserScan,
+        odom: Odometry,
     ) -> tuple[Optional[int], Optional[float]]:
         for action_idx, _q_value in q_ranked:
             if action_idx not in self.allowed_actions:
                 continue
 
-            selected_sector_min = self.action_sector_min(action_idx, scan)
+            selected_sector_min = self.action_sector_min(action_idx, scan, odom)
             if selected_sector_min is not None and selected_sector_min >= self.min_sector_dist:
                 return action_idx, selected_sector_min
 
@@ -819,51 +1019,86 @@ class RealcarPolicySafeRunner(Node):
 
     def wait_for_inputs(
         self,
-        after_scan_received_at: Optional[float] = None,
-        after_odom_received_at: Optional[float] = None,
+        after_scan_sequence: int = -1,
+        after_odom_sequence: int = -1,
+        after_monotonic: Optional[float] = None,
     ) -> None:
         deadline = time.monotonic() + self.decision_timeout_sec
         last_error = "no messages received"
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.latest_scan is not None and self.latest_odom is not None:
-                newer_scan_received = self.latest_scan_received_at is not None
-                if newer_scan_received and after_scan_received_at is not None:
-                    newer_scan_received = (
-                        self.latest_scan_received_at > after_scan_received_at
+                newer_scan_received = self.scan_sequence > after_scan_sequence
+                newer_odom_received = self.odom_sequence > after_odom_sequence
+                if after_monotonic is not None:
+                    newer_scan_received = sensor_sample_is_after_barrier(
+                        self.scan_sequence,
+                        self.latest_scan_received_at,
+                        after_scan_sequence,
+                        after_monotonic,
                     )
-                newer_odom_received = self.latest_odom_received_at is not None
-                if newer_odom_received and after_odom_received_at is not None:
-                    newer_odom_received = (
-                        self.latest_odom_received_at > after_odom_received_at
+                    newer_odom_received = sensor_sample_is_after_barrier(
+                        self.odom_sequence,
+                        self.latest_odom_received_at,
+                        after_odom_sequence,
+                        after_monotonic,
                     )
                 if not newer_scan_received or not newer_odom_received:
-                    last_error = "waiting for newer /scan and /odom samples"
+                    last_error = (
+                        "waiting for post-barrier /scan and /odom samples: "
+                        f"scan={self.scan_sequence}>{after_scan_sequence} "
+                        f"odom={self.odom_sequence}>{after_odom_sequence}"
+                    )
                     continue
                 try:
                     self.require_fresh_inputs()
                     return
                 except RuntimeError as exc:
                     last_error = str(exc)
-        raise TimeoutError(f"timeout waiting for fresh /scan and /odom: {last_error}")
+        diagnostics = self.format_sensor_age_diagnostics(
+            self.sensor_age_diagnostics()
+        )
+        raise TimeoutError(
+            "timeout waiting for fresh /scan and /odom: "
+            f"{last_error}; {diagnostics}"
+        )
+
+    def capture_sensor_refresh_barrier(self) -> SensorRefreshBarrier:
+        return SensorRefreshBarrier(
+            scan_sequence=self.scan_sequence,
+            odom_sequence=self.odom_sequence,
+            started_monotonic=time.monotonic(),
+        )
+
+    def refresh_inputs_after_barrier(
+        self,
+        barrier: SensorRefreshBarrier,
+    ) -> tuple[LaserScan, Odometry]:
+        self.wait_for_inputs(
+            after_scan_sequence=barrier.scan_sequence,
+            after_odom_sequence=barrier.odom_sequence,
+            after_monotonic=barrier.started_monotonic,
+        )
+        if self.latest_scan is None or self.latest_odom is None:
+            raise RuntimeError("missing /scan or /odom after sensor refresh barrier")
+        return self.latest_scan, self.latest_odom
 
     def consume_new_step_inputs(self) -> tuple[LaserScan, Odometry]:
         self.wait_for_inputs(
-            self.last_consumed_scan_received_at,
-            self.last_consumed_odom_received_at,
+            self.last_consumed_scan_sequence,
+            self.last_consumed_odom_sequence,
         )
         if self.latest_scan is None or self.latest_odom is None:
             raise RuntimeError("missing /scan or /odom after fresh input wait")
-        self.last_consumed_scan_received_at = self.latest_scan_received_at
-        self.last_consumed_odom_received_at = self.latest_odom_received_at
+        self.last_consumed_scan_sequence = self.scan_sequence
+        self.last_consumed_odom_sequence = self.odom_sequence
         return self.latest_scan, self.latest_odom
 
     def refresh_after_motion(self) -> None:
-        after_scan = self.latest_scan_received_at
-        after_odom = self.latest_odom_received_at
-        self.wait_for_inputs(after_scan, after_odom)
-        self.last_consumed_scan_received_at = self.latest_scan_received_at
-        self.last_consumed_odom_received_at = self.latest_odom_received_at
+        barrier = self.capture_sensor_refresh_barrier()
+        self.refresh_inputs_after_barrier(barrier)
+        self.last_consumed_scan_sequence = self.scan_sequence
+        self.last_consumed_odom_sequence = self.odom_sequence
 
     def target_for_action(
         self,
@@ -877,6 +1112,38 @@ class RealcarPolicySafeRunner(Node):
             start_y=y0,
             step_distance=self.step_distance,
         )
+
+    def prepare_pre_motion_plan(
+        self,
+        raw_policy_action: int,
+        q_ranked: list[tuple[int, float]],
+        scan: LaserScan,
+        odom: Odometry,
+    ) -> tuple[
+        PreMotionActionSelection,
+        dict[str, float],
+        Optional[ActionExecutionTarget],
+    ]:
+        selection = select_pre_motion_action(
+            raw_policy_action=raw_policy_action,
+            q_ranked=q_ranked,
+            allowed_actions=self.allowed_actions,
+            allow_lidar_fallback=self.all8_action_mode,
+            evaluate_lidar=lambda action_idx: self.lidar_gate(
+                action_idx,
+                scan,
+                odom,
+            ),
+        )
+        pre_motion_pose = self.pose_record_from_odom(odom)
+        target: Optional[ActionExecutionTarget] = None
+        if selection.executed_action is not None:
+            target = self.target_for_action(
+                selection.executed_action,
+                pre_motion_pose["x"],
+                pre_motion_pose["y"],
+            )
+        return selection, pre_motion_pose, target
 
     def agent_state_from_odom(
         self,
@@ -1040,7 +1307,7 @@ class RealcarPolicySafeRunner(Node):
 
     def log_step(
         self,
-        step_id: int,
+        record: dict[str, Any],
         raw_action_idx: int,
         q_list: list[float],
         q_ranked: list[tuple[int, float]],
@@ -1057,6 +1324,7 @@ class RealcarPolicySafeRunner(Node):
         final_dist: Optional[float],
         node_exit_reason: str,
     ) -> None:
+        step_id = int(record["step_id"])
         final_dist_text = "NA" if final_dist is None else f"{final_dist:.3f}"
         scan_stats_text = (
             f"scan_count={scan_stats['scan_count']} "
@@ -1078,6 +1346,28 @@ class RealcarPolicySafeRunner(Node):
         self.get_logger().warn(f"scan_diagnostics step_id={step_id} {scan_stats_text}")
         self.get_logger().warn(f"sector_diagnostics step_id={step_id} {sector_text}")
         self.get_logger().warn(
+            "pre_motion_diagnostics "
+            f"step_id={step_id} "
+            "policy_state_build_duration_sec="
+            f"{format_optional_float(record['policy_state_build_duration_sec'])} "
+            "policy_inference_duration_sec="
+            f"{format_optional_float(record['policy_inference_duration_sec'])} "
+            "pre_motion_refresh_duration_sec="
+            f"{format_optional_float(record['pre_motion_refresh_duration_sec'])} "
+            f"scan_sequence={record['scan_sequence']} "
+            "scan_receive_age_sec="
+            f"{format_optional_float(record['scan_receive_age_sec'])} "
+            "scan_header_age_sec="
+            f"{format_optional_float(record['scan_header_age_sec'])} "
+            f"odom_sequence={record['odom_sequence']} "
+            "odom_receive_age_sec="
+            f"{format_optional_float(record['odom_receive_age_sec'])} "
+            "odom_header_age_sec="
+            f"{format_optional_float(record['odom_header_age_sec'])} "
+            f"pre_motion_pose={record['pre_motion_pose']} "
+            f"target_pose={record['target_pose']}"
+        )
+        self.get_logger().warn(
             "q_diagnostics "
             f"step_id={step_id} "
             f"q_ranked={q_ranked} "
@@ -1091,11 +1381,12 @@ class RealcarPolicySafeRunner(Node):
             f"full_action_mode={self.full_action_mode} "
             f"allowed_actions={sorted(self.allowed_actions)} "
             f"diagonal_mode={self.diagonal_mode} "
-            f"raw_action_idx={raw_action_idx} "
-            f"selected_action_idx={selected_action_idx} "
+            f"raw_policy_action={raw_action_idx} "
+            f"pre_motion_requested_action={raw_action_idx} "
+            f"executed_action={selected_action_idx} "
             f"best_allowed_action_idx={best_allowed_action_idx} "
             f"best_allowed_action_q={best_allowed_action_q:.4f} "
-            f"fallback_used={str(fallback_used).lower()} "
+            f"safety_fallback_used={str(fallback_used).lower()} "
             f"q_values={q_list} "
             f"action_filter_passed={str(action_filter_passed).lower()} "
             f"lidar_gate_passed={str(lidar_gate_passed).lower()} "
@@ -1108,7 +1399,13 @@ class RealcarPolicySafeRunner(Node):
         )
 
     def run(self) -> str:
+        model_load_started = time.monotonic()
         model, adapter, torch = load_policy_model(self.checkpoint_path)
+        model_load_duration = time.monotonic() - model_load_started
+        self.experiment_result["model_load_duration_sec"] = model_load_duration
+        self.get_logger().warn(
+            f"model_load_duration_sec={model_load_duration:.3f}"
+        )
 
         from env.core_cummap import CumulativeBeliefMap
 
@@ -1122,18 +1419,20 @@ class RealcarPolicySafeRunner(Node):
             step_record, step_started = self.begin_step_record(step_id)
             try:
                 scan, odom = self.consume_new_step_inputs()
-                start_pose = self.pose_record()
-                step_record["start_pose"] = start_pose
+                observation_pose = self.pose_record_from_odom(odom)
+                step_record["observation_pose"] = observation_pose
                 if self.odom_state_origin is None:
-                    self.odom_state_origin = (start_pose["x"], start_pose["y"])
+                    self.odom_state_origin = (
+                        observation_pose["x"],
+                        observation_pose["y"],
+                    )
                 agent_state = self.agent_state_from_odom(
                     origin_state,
-                    start_pose["x"],
-                    start_pose["y"],
+                    observation_pose["x"],
+                    observation_pose["y"],
                 )
 
-                scan_stats = self.scan_stats(scan)
-                sector_mins = self.sector_diagnostics(scan)
+                state_build_started = time.monotonic()
                 snap = self.build_local_snap(scan, odom)
                 if cum_map is None:
                     cum_map = CumulativeBeliefMap(true_grid, agent_state, snap)
@@ -1146,8 +1445,16 @@ class RealcarPolicySafeRunner(Node):
                     recent_trajectory_positions=recent_positions,
                     return_state_meta=True,
                 )
+                step_record["policy_state_build_duration_sec"] = (
+                    time.monotonic() - state_build_started
+                )
+                inference_started = time.monotonic()
                 with torch.inference_mode():
                     q_values = model(**state_batch, return_aux=False)
+                step_record["policy_inference_duration_sec"] = (
+                    time.monotonic() - inference_started
+                )
+                post_inference_barrier = self.capture_sensor_refresh_barrier()
 
                 q_np = q_values.detach().cpu().numpy()[0]
                 q_list = [round(float(v), 4) for v in q_np.tolist()]
@@ -1167,26 +1474,14 @@ class RealcarPolicySafeRunner(Node):
                     key=lambda item: item[1],
                 )
                 raw_action_idx = int(torch.argmax(q_values, dim=1).item())
-
-                raw_action_allowed = raw_action_idx in self.allowed_actions
-                fallback_used = False
-                action_filter_passed = raw_action_allowed
-                lidar_gate_passed = False
-                observed_min_dist: Optional[float] = None
-                selected_sector_min: Optional[float] = None
-                selected_action_idx: Optional[int] = None
+                step_record["raw_policy_action"] = raw_action_idx
+                step_record["pre_motion_requested_action"] = raw_action_idx
                 final_dist: Optional[float] = None
 
-                if raw_action_allowed:
-                    selected_action_idx = raw_action_idx
-
-                if not action_filter_passed:
-                    blocked_target = self.target_for_action(
-                        raw_action_idx,
-                        start_pose["x"],
-                        start_pose["y"],
-                    )
-                    self.set_step_target(step_record, blocked_target)
+                if raw_action_idx not in self.allowed_actions:
+                    scan_stats = self.scan_stats(scan)
+                    sector_mins = self.sector_diagnostics(scan)
+                    step_record.update(self.sensor_age_diagnostics())
                     self.stop()
                     self.finish_step_record(
                         step_record,
@@ -1195,7 +1490,7 @@ class RealcarPolicySafeRunner(Node):
                         "blocked_by_action_filter",
                     )
                     self.log_step(
-                        step_id,
+                        step_record,
                         raw_action_idx,
                         q_list,
                         q_ranked,
@@ -1203,48 +1498,58 @@ class RealcarPolicySafeRunner(Node):
                         best_allowed_action_q,
                         scan_stats,
                         sector_mins,
-                        fallback_used,
-                        action_filter_passed,
-                        lidar_gate_passed,
-                        observed_min_dist,
-                        selected_sector_min,
-                        selected_action_idx,
+                        False,
+                        False,
+                        False,
+                        None,
+                        None,
+                        None,
                         final_dist,
                         "blocked_by_action_filter",
                     )
                     return "blocked_by_action_filter"
 
-                if selected_action_idx not in self.allowed_actions:
-                    raise RuntimeError(
-                        "selected_action_idx is not allowed: "
-                        f"{selected_action_idx}"
+                pre_motion_scan = scan
+                pre_motion_odom = odom
+                if self.execute:
+                    refresh_started = time.monotonic()
+                    try:
+                        pre_motion_scan, pre_motion_odom = (
+                            self.refresh_inputs_after_barrier(
+                                post_inference_barrier
+                            )
+                        )
+                    finally:
+                        step_record["pre_motion_refresh_duration_sec"] = (
+                            time.monotonic() - refresh_started
+                        )
+                else:
+                    step_record["pre_motion_refresh_duration_sec"] = 0.0
+
+                step_record.update(self.sensor_age_diagnostics())
+                selection, pre_motion_pose, target = (
+                    self.prepare_pre_motion_plan(
+                        raw_action_idx,
+                        q_ranked,
+                        pre_motion_scan,
+                        pre_motion_odom,
                     )
-
-                lidar_gate_passed, observed_min_dist = self.lidar_gate(
-                    selected_action_idx,
-                    scan,
                 )
-                selected_sector_min = observed_min_dist
-
-                if self.all8_action_mode and not lidar_gate_passed:
-                    next_action_idx, next_sector_min = (
-                        self.choose_first_lidar_passed_action(q_ranked, scan)
-                    )
-                    if next_action_idx is not None:
-                        selected_action_idx = next_action_idx
-                        selected_sector_min = next_sector_min
-                        observed_min_dist = next_sector_min
-                        lidar_gate_passed = True
-                        fallback_used = selected_action_idx != raw_action_idx
-
-                target = self.target_for_action(
-                    selected_action_idx,
-                    start_pose["x"],
-                    start_pose["y"],
+                step_record["pre_motion_pose"] = pre_motion_pose
+                step_record["start_pose"] = pre_motion_pose
+                step_record["pre_motion_executed_action"] = (
+                    selection.executed_action
                 )
-                self.set_step_target(step_record, target)
+                step_record["safety_fallback_used"] = (
+                    selection.safety_fallback_used
+                )
+                scan_stats = self.scan_stats(pre_motion_scan)
+                sector_mins = self.sector_diagnostics(pre_motion_scan)
 
-                if not lidar_gate_passed:
+                if target is not None:
+                    self.set_step_target(step_record, target)
+
+                if not selection.lidar_gate_passed or target is None:
                     self.stop()
                     self.finish_step_record(
                         step_record,
@@ -1253,7 +1558,7 @@ class RealcarPolicySafeRunner(Node):
                         "blocked_by_lidar_gate",
                     )
                     self.log_step(
-                        step_id,
+                        step_record,
                         raw_action_idx,
                         q_list,
                         q_ranked,
@@ -1261,16 +1566,22 @@ class RealcarPolicySafeRunner(Node):
                         best_allowed_action_q,
                         scan_stats,
                         sector_mins,
-                        fallback_used,
-                        action_filter_passed,
-                        lidar_gate_passed,
-                        observed_min_dist,
-                        selected_sector_min,
-                        selected_action_idx,
+                        selection.safety_fallback_used,
+                        selection.action_filter_passed,
+                        selection.lidar_gate_passed,
+                        selection.observed_min_dist,
+                        selection.selected_sector_min,
+                        selection.executed_action,
                         final_dist,
                         "blocked_by_lidar_gate",
                     )
                     return "blocked_by_lidar_gate"
+
+                selected_action_idx = selection.executed_action
+                if selected_action_idx is None:
+                    raise RuntimeError(
+                        "no executed action after passed LiDAR gate"
+                    )
 
                 node_exit_reason = "dry_plan_complete"
                 if self.execute:
@@ -1282,8 +1593,9 @@ class RealcarPolicySafeRunner(Node):
                         f"action={selected_action_idx}:"
                         f"{ACTION_NAMES[selected_action_idx]} "
                         "start_xy="
-                        f"({start_pose['x']:.3f},{start_pose['y']:.3f}) "
-                        f"yaw={start_pose['yaw_deg']:+.1f}deg "
+                        f"({pre_motion_pose['x']:.3f},"
+                        f"{pre_motion_pose['y']:.3f}) "
+                        f"yaw={pre_motion_pose['yaw_deg']:+.1f}deg "
                         f"odom_direction={target.odom_direction} "
                         "target_xy="
                         f"({target.target_x:.3f},{target.target_y:.3f})"
@@ -1315,7 +1627,7 @@ class RealcarPolicySafeRunner(Node):
                     node_exit_reason = "max_steps_reached"
 
                 self.log_step(
-                    step_id,
+                    step_record,
                     raw_action_idx,
                     q_list,
                     q_ranked,
@@ -1323,11 +1635,11 @@ class RealcarPolicySafeRunner(Node):
                     best_allowed_action_q,
                     scan_stats,
                     sector_mins,
-                    fallback_used,
-                    action_filter_passed,
-                    lidar_gate_passed,
-                    observed_min_dist,
-                    selected_sector_min,
+                    selection.safety_fallback_used,
+                    selection.action_filter_passed,
+                    selection.lidar_gate_passed,
+                    selection.observed_min_dist,
+                    selection.selected_sector_min,
                     selected_action_idx,
                     final_dist,
                     node_exit_reason,
@@ -1335,6 +1647,7 @@ class RealcarPolicySafeRunner(Node):
 
             except KeyboardInterrupt:
                 self.stop()
+                step_record.update(self.sensor_age_diagnostics())
                 self.finish_step_record(
                     step_record,
                     step_started,
@@ -1344,6 +1657,8 @@ class RealcarPolicySafeRunner(Node):
                 raise
             except Exception as exc:
                 self.stop()
+                diagnostics = self.sensor_age_diagnostics()
+                step_record.update(diagnostics)
                 self.finish_step_record(
                     step_record,
                     step_started,
@@ -1352,7 +1667,8 @@ class RealcarPolicySafeRunner(Node):
                 )
                 self.get_logger().error(
                     f"step_id={step_id} failed; "
-                    f"remaining steps cancelled: {exc}"
+                    f"remaining steps cancelled: {exc}; "
+                    f"{self.format_sensor_age_diagnostics(diagnostics)}"
                 )
                 return f"step_failed: {exc}"
 

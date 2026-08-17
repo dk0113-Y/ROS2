@@ -160,12 +160,23 @@ JSON 和终端结果增加 `motion_mode`、`target_pose`、`rotate_start_yaw`、
 ```text
 获取一组新的且时间戳有效的 /scan、/odom
   -> 更新累计观测并执行一次 policy inference
-  -> realcar_action_adapter 生成固定 odom 目标
+  -> 记录 post-inference sensor barrier
+  -> 等待 barrier 后新收到且 receive/header 时间均有效的 /scan、/odom
+  -> 使用刷新后的 /scan 重新执行 LiDAR safety gate
+  -> 确定最终 executed action（可能为安全 fallback）
+  -> 使用刷新后的 odom 与最终 action 生成固定 odom 目标
   -> execute=true 时执行 safe_rotate_drive，等待动作完成并发布零速度
   -> 再等待一组新的 /scan、/odom
   -> 根据累计 odom 位移生成下一 DRL 网格状态
   -> 进入下一步，最多三步
 ```
+
+runner 的 `/scan`、`/odom` 订阅使用 `KEEP_LAST depth=1`，避免 policy
+inference 阻塞 spin 时保留约一秒的历史队列。barrier 同时检查 callback 序列号和
+monotonic receive time；刷新后的样本仍必须通过默认 `0.5s` 的 receive/header
+freshness 检查，超时不会通过放宽阈值处理。逐步 JSON 和摘要日志会记录 model
+load、policy state build、policy inference、pre-motion refresh 耗时，以及两类传感器
+的序列号和 receive/header age。
 
 `step_distance` 与训练网格 `cell_size=0.35m` 不一致时会明确警告。runner 不再按所选动作盲目把抽象状态移动一格，而是用相对实验起点的累计 odom 位移量化到原有 DRL 行列坐标；小于半个网格的位移会保留在同一抽象单元。因此该机制只用于有限步迁移实验，仍存在连续坐标到离散网格的量化误差。
 
