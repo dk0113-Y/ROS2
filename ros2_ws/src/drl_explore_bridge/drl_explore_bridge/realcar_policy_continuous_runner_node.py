@@ -841,7 +841,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             target.target_x - pose["x"],
             target.target_y - pose["y"],
         )
-        motion_yaw_in_base = norm_angle(target.target_yaw - pose["yaw"])
+        motion_yaw_in_base = norm_angle(
+            target.target_yaw - pose["yaw_rad"]
+        )
         return scan_capsule_footprint_check(
             scan,
             motion_yaw_in_base,

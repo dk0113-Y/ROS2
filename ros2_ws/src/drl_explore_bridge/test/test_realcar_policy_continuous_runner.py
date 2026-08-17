@@ -43,6 +43,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
     ACTION_NAMES,
+    RealcarPolicySafeRunner,
     SensorRefreshBarrier,
     create_sensor_callback_groups,
     odom_delta_to_grid_offset,
@@ -84,6 +85,26 @@ def make_single_hit_scan(distance, angle=0.0):
     scan.ranges = [float(distance)]
     scan.header.stamp.sec = 100
     return scan
+
+
+def make_scan_for_base_point(point_x, point_y):
+    """Create one laser hit for an exact point in the base frame."""
+    laser_dx = point_x - DEFAULT_LASER_X_IN_BASE_M
+    laser_dy = point_y - DEFAULT_LASER_Y_IN_BASE_M
+    return make_single_hit_scan(
+        math.hypot(laser_dx, laser_dy),
+        math.atan2(laser_dy, laser_dx),
+    )
+
+
+class ProductionFootprintHarness:
+    """Supply parameters without overriding the production footprint check."""
+
+    footprint_radius_m = DEFAULT_FOOTPRINT_RADIUS_M
+    longitudinal_extra_margin_m = DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M
+    laser_x_in_base_m = DEFAULT_LASER_X_IN_BASE_M
+    laser_y_in_base_m = DEFAULT_LASER_Y_IN_BASE_M
+    laser_yaw_in_base = 0.0
 
 
 class PlanHarness:
@@ -476,6 +497,43 @@ def test_scan_hits_are_transformed_with_verified_laser_translation():
     assert points == pytest.approx(
         [(1.0 + DEFAULT_LASER_X_IN_BASE_M, DEFAULT_LASER_Y_IN_BASE_M)]
     )
+
+
+@pytest.mark.parametrize("robot_yaw", (0.0, math.pi / 2.0))
+def test_production_footprint_check_uses_canonical_pose_yaw(robot_yaw):
+    odom = make_odom(x=1.0, y=-2.0, yaw=robot_yaw)
+    pose = RealcarPolicySafeRunner.pose_record_from_odom(odom)
+    adapter = RealcarActionAdapter(ACTIONS_8, ACTION_NAMES, "grid_center")
+    target = adapter.target_for_action(2, pose["x"], pose["y"], 0.35)
+    motion_yaw_in_base = target.target_yaw - pose["yaw_rad"]
+    along_point = (
+        0.50 * math.cos(motion_yaw_in_base),
+        0.50 * math.sin(motion_yaw_in_base),
+    )
+    orthogonal_point = (
+        0.50 * math.cos(motion_yaw_in_base + math.pi / 2.0),
+        0.50 * math.sin(motion_yaw_in_base + math.pi / 2.0),
+    )
+    harness = ProductionFootprintHarness()
+
+    blocked = RealcarPolicyContinuousRunner.pre_motion_footprint_check(
+        harness,
+        target,
+        pose,
+        make_scan_for_base_point(*along_point),
+    )
+    clear = RealcarPolicyContinuousRunner.pre_motion_footprint_check(
+        harness,
+        target,
+        pose,
+        make_scan_for_base_point(*orthogonal_point),
+    )
+
+    assert "yaw" not in pose
+    assert pose["yaw_rad"] == pytest.approx(robot_yaw)
+    assert not blocked.passed
+    assert blocked.obstruction_type == "longitudinal_path_obstruction"
+    assert clear.passed
 
 
 @pytest.mark.parametrize(
