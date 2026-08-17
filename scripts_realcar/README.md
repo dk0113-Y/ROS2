@@ -118,3 +118,35 @@ export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
 节点在运动前打印 `step_experiment_start`，结束或失败后打印 `step_experiment_result`，包括动作、起止位姿、目标方向、目标距离、实际位移、耗时和失败原因。每次结果同时保存为 JSON。参数 `result_file_path` 默认是 `~/realcar_logs/`，目录会自动创建，默认文件名形如 `realcar_step_YYYYMMDD_HHMMSS.json`；也可传入一个明确的 `.json` 文件路径。已有明确文件不会被覆盖。
 
 `execute=false` 的观察记录会以 `success=false`、`failure_reason=execution_disabled` 保存，表示没有进行运动验证。`execute=true` 仅代表允许该节点执行一次既有的低速旋转和直行控制，并不构成连续自主探索或真实运动闭环验证。
+
+## Round 2 动作适配与运动模式
+
+`realcar_action_adapter.py` 不改变 `ACTIONS_8`，只把既有网格增量转换为固定的 odom 目标。DRL 行、列与 odom 轴的对应关系为：
+
+| action_idx | 方向 | odom 方向 |
+| --- | --- | --- |
+| 0 | N | `+y` |
+| 1 | NE | `+x, +y` |
+| 2 | E | `+x` |
+| 3 | SE | `+x, -y` |
+| 4 | S | `-y` |
+| 5 | SW | `-x, -y` |
+| 6 | W | `-x` |
+| 7 | NW | `-x, +y` |
+
+单步节点的 `motion_mode` 支持：
+
+- `safe_rotate_drive`：默认模式，保留先原地旋转、再低速直行的安全验证流程；
+- `adapter_drive`：实验模式，在一次闭环中根据目标点方位同时调节 `linear.x` 和 `angular.z`。偏航误差超过 `adapter_heading_stop_deg` 时线速度保持为零。
+
+90 度及更大转角不再通过提高默认角速度来处理。`rotate_max_w` 仍默认为 `0.35 rad/s`，`rotate_wall_timeout` 默认由 6 秒延长到 40 秒；同时增加旋转进展看门狗，默认要求每 5 秒至少减少 2 度偏航误差，卡住时会提前失败。到达 `rotate_tol_deg` 后先连续确认 5 次并发布零角速度。可配置参数包括 `rotate_kp`、`rotate_min_w`、`rotate_max_w`、`rotate_tol_deg`、`rotate_wall_timeout`、`rotate_progress_timeout`、`rotate_min_progress_deg`、`adapter_angular_kp`、`adapter_heading_stop_deg` 和 `adapter_drive_wall_timeout`。
+
+只观察新的 odom 动作解释时仍保持默认安全开关：
+
+```bash
+./scripts_realcar/run_realcar_step_once_experiment.sh \
+  -p action_idx:=0 \
+  -p motion_mode:=safe_rotate_drive
+```
+
+JSON 和终端结果增加 `motion_mode`、`target_pose`、`rotate_start_yaw`、`target_yaw`、`final_yaw`、`rotate_success` 和 `rotate_error`。`realcar_policy_safe_runner_node` 尚未完成连续探索适配；当 `max_steps > 1` 且 `step_distance` 与 DRL `cell_size=0.35m` 不一致时，节点会打印明确警告并拒绝启动，防止物理位移与 DRL 状态更新自动发生偏离。

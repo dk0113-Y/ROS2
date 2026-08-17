@@ -15,6 +15,11 @@ from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import LaserScan
 
+from drl_explore_bridge.realcar_action_adapter import (
+    ActionExecutionTarget,
+    RealcarActionAdapter,
+)
+
 
 ACTIONS_8 = (
     (-1, 0),    # 0 N: left
@@ -66,16 +71,23 @@ class RealcarStepOnceSafeNode(Node):
         self.declare_parameter("execute", False)
         self.declare_parameter("action_idx", 2)
         self.declare_parameter("step_distance", 0.18)
+        self.declare_parameter("motion_mode", "safe_rotate_drive")
+        self.declare_parameter("diagonal_mode", "grid_center")
 
         self.declare_parameter("rotate_kp", 1.2)
         self.declare_parameter("rotate_max_w", 0.35)
         self.declare_parameter("rotate_min_w", 0.08)
         self.declare_parameter("rotate_tol_deg", 6.0)
-        self.declare_parameter("rotate_wall_timeout", 6.0)
+        self.declare_parameter("rotate_wall_timeout", 40.0)
+        self.declare_parameter("rotate_progress_timeout", 5.0)
+        self.declare_parameter("rotate_min_progress_deg", 2.0)
 
         self.declare_parameter("linear_speed", 0.04)
         self.declare_parameter("target_pos_tol", 0.04)
         self.declare_parameter("drive_wall_timeout", 6.0)
+        self.declare_parameter("adapter_angular_kp", 0.8)
+        self.declare_parameter("adapter_heading_stop_deg", 60.0)
+        self.declare_parameter("adapter_drive_wall_timeout", 25.0)
         self.declare_parameter("control_debug_period", 0.5)
         self.declare_parameter("scan_timeout_sec", 0.5)
         self.declare_parameter("odom_timeout_sec", 0.5)
@@ -85,16 +97,36 @@ class RealcarStepOnceSafeNode(Node):
         self.execute = bool(self.get_parameter("execute").value)
         self.action_idx = int(self.get_parameter("action_idx").value)
         self.step_distance = float(self.get_parameter("step_distance").value)
+        self.motion_mode = str(self.get_parameter("motion_mode").value)
+        self.diagonal_mode = str(self.get_parameter("diagonal_mode").value)
 
         self.rotate_kp = float(self.get_parameter("rotate_kp").value)
         self.rotate_max_w = float(self.get_parameter("rotate_max_w").value)
         self.rotate_min_w = float(self.get_parameter("rotate_min_w").value)
-        self.rotate_tol = math.radians(float(self.get_parameter("rotate_tol_deg").value))
+        self.rotate_tol_deg = float(self.get_parameter("rotate_tol_deg").value)
+        self.rotate_tol = math.radians(self.rotate_tol_deg)
         self.rotate_wall_timeout = float(self.get_parameter("rotate_wall_timeout").value)
+        self.rotate_progress_timeout = float(
+            self.get_parameter("rotate_progress_timeout").value
+        )
+        self.rotate_min_progress_deg = float(
+            self.get_parameter("rotate_min_progress_deg").value
+        )
+        self.rotate_min_progress = math.radians(self.rotate_min_progress_deg)
 
         self.linear_speed = float(self.get_parameter("linear_speed").value)
         self.target_pos_tol = float(self.get_parameter("target_pos_tol").value)
         self.drive_wall_timeout = float(self.get_parameter("drive_wall_timeout").value)
+        self.adapter_angular_kp = float(
+            self.get_parameter("adapter_angular_kp").value
+        )
+        self.adapter_heading_stop_deg = float(
+            self.get_parameter("adapter_heading_stop_deg").value
+        )
+        self.adapter_heading_stop = math.radians(self.adapter_heading_stop_deg)
+        self.adapter_drive_wall_timeout = float(
+            self.get_parameter("adapter_drive_wall_timeout").value
+        )
         self.control_debug_period = float(self.get_parameter("control_debug_period").value)
         self.scan_timeout_sec = float(self.get_parameter("scan_timeout_sec").value)
         self.odom_timeout_sec = float(self.get_parameter("odom_timeout_sec").value)
@@ -106,6 +138,15 @@ class RealcarStepOnceSafeNode(Node):
         if not (0 <= self.action_idx < len(ACTIONS_8)):
             raise ValueError(f"action_idx out of range: {self.action_idx}")
 
+        if self.motion_mode not in ("safe_rotate_drive", "adapter_drive"):
+            raise ValueError(
+                "motion_mode must be 'safe_rotate_drive' or 'adapter_drive'"
+            )
+        if self.diagonal_mode not in RealcarActionAdapter.SUPPORTED_DIAGONAL_MODES:
+            raise ValueError(
+                "diagonal_mode must be 'grid_center' or 'constant_length'"
+            )
+
         if self.step_distance <= 0.0 or self.step_distance > 0.25:
             raise ValueError("step_distance must be in (0, 0.25] for first realcar test")
 
@@ -114,6 +155,28 @@ class RealcarStepOnceSafeNode(Node):
 
         if self.rotate_max_w <= 0.0 or self.rotate_max_w > MAX_ANGULAR_SPEED:
             raise ValueError("rotate_max_w must be in (0, 0.40] for first realcar test")
+        if self.rotate_kp <= 0.0:
+            raise ValueError("rotate_kp must be > 0")
+        if self.rotate_min_w <= 0.0 or self.rotate_min_w > self.rotate_max_w:
+            raise ValueError("rotate_min_w must be in (0, rotate_max_w]")
+        if self.rotate_tol_deg <= 0.0 or self.rotate_tol_deg > 45.0:
+            raise ValueError("rotate_tol_deg must be in (0, 45]")
+        if self.rotate_wall_timeout <= 0.0:
+            raise ValueError("rotate_wall_timeout must be > 0")
+        if self.rotate_progress_timeout <= 0.0:
+            raise ValueError("rotate_progress_timeout must be > 0")
+        if self.rotate_min_progress_deg <= 0.0:
+            raise ValueError("rotate_min_progress_deg must be > 0")
+        if self.target_pos_tol <= 0.0:
+            raise ValueError("target_pos_tol must be > 0")
+        if self.drive_wall_timeout <= 0.0:
+            raise ValueError("drive_wall_timeout must be > 0")
+        if self.adapter_angular_kp <= 0.0:
+            raise ValueError("adapter_angular_kp must be > 0")
+        if not (0.0 < self.adapter_heading_stop_deg <= 90.0):
+            raise ValueError("adapter_heading_stop_deg must be in (0, 90]")
+        if self.adapter_drive_wall_timeout <= 0.0:
+            raise ValueError("adapter_drive_wall_timeout must be > 0")
         if self.scan_timeout_sec <= 0.0 or self.odom_timeout_sec <= 0.0:
             raise ValueError("sensor timeout parameters must be > 0")
         if self.sensor_future_tolerance_sec < 0.0:
@@ -121,6 +184,11 @@ class RealcarStepOnceSafeNode(Node):
 
         self.result_directory, self.explicit_result_file = self.prepare_result_location(
             self.result_file_path
+        )
+        self.action_adapter = RealcarActionAdapter(
+            ACTIONS_8,
+            ACTION_NAMES,
+            diagonal_mode=self.diagonal_mode,
         )
 
         self.latest_scan: Optional[LaserScan] = None
@@ -159,8 +227,13 @@ class RealcarStepOnceSafeNode(Node):
             "realcar_step_once_safe_node started. "
             f"execute={self.execute}, "
             f"action_idx={self.action_idx}:{ACTION_NAMES[self.action_idx]}, "
+            f"motion_mode={self.motion_mode}, diagonal_mode={self.diagonal_mode}, "
             f"step_distance={self.step_distance:.3f}, linear_speed={self.linear_speed:.3f}, "
             f"rotate_max_w={self.rotate_max_w:.3f}, "
+            f"rotate_tol_deg={self.rotate_tol_deg:.1f}, "
+            f"rotate_wall_timeout={self.rotate_wall_timeout:.1f}, "
+            f"rotate_progress_timeout={self.rotate_progress_timeout:.1f}, "
+            f"rotate_min_progress_deg={self.rotate_min_progress_deg:.1f}, "
             f"result_file_path={self.result_file_path}. "
             "This node can publish non-zero /cmd_vel only when execute=true (default false)."
         )
@@ -201,34 +274,35 @@ class RealcarStepOnceSafeNode(Node):
     def begin_experiment(
         self,
         start_pose: dict[str, float],
-        tx: float,
-        ty: float,
-        rel_forward: float,
-        rel_left: float,
+        target: ActionExecutionTarget,
     ) -> None:
         started_at = datetime.now().astimezone()
-        target_yaw = math.atan2(ty - start_pose["y"], tx - start_pose["x"])
-        target_distance = math.hypot(
-            tx - start_pose["x"],
-            ty - start_pose["y"],
-        )
+        initial_rotate_error = norm_angle(target.target_yaw - start_pose["yaw_rad"])
         self.experiment_started_monotonic = time.monotonic()
         self.experiment_result = {
             "timestamp": started_at.isoformat(timespec="milliseconds"),
             "action_idx": self.action_idx,
             "action_name": ACTION_NAMES[self.action_idx],
             "execute": self.execute,
+            "motion_mode": self.motion_mode,
+            "diagonal_mode": self.diagonal_mode,
             "start_pose": start_pose,
             "end_pose": None,
-            "target_direction": {
-                "action_name": ACTION_NAMES[self.action_idx],
-                "relative_forward_m": rel_forward,
-                "relative_left_m": rel_left,
-                "world_yaw_rad": target_yaw,
-                "world_yaw_deg": math.degrees(target_yaw),
+            "target_direction": target.as_dict(),
+            "target_pose": {
+                "x": target.target_x,
+                "y": target.target_y,
+                "yaw_rad": target.target_yaw,
+                "yaw_deg": math.degrees(target.target_yaw),
             },
-            "target_position": {"x": tx, "y": ty},
-            "target_distance": target_distance,
+            "target_position": {"x": target.target_x, "y": target.target_y},
+            "target_distance": target.target_distance,
+            "rotate_start_yaw": start_pose["yaw_rad"],
+            "target_yaw": target.target_yaw,
+            "final_yaw": start_pose["yaw_rad"],
+            "rotate_success": False,
+            "rotate_error": initial_rotate_error,
+            "rotate_error_deg": math.degrees(initial_rotate_error),
             "actual_distance": None,
             "actual_displacement": None,
             "duration": None,
@@ -259,15 +333,37 @@ class RealcarStepOnceSafeNode(Node):
         result = self.experiment_result
         start_pose = result["start_pose"]
         target_direction = result["target_direction"]
+        target_pose = result["target_pose"]
         self.get_logger().warn(
             "step_experiment_start:\n"
             f"  timestamp: {result['timestamp']}\n"
             f"  action_idx: {result['action_idx']}\n"
+            f"  motion_mode: {result['motion_mode']}\n"
             f"  start_pose: x={start_pose['x']:.6f}, y={start_pose['y']:.6f}, "
             f"yaw_rad={start_pose['yaw_rad']:.6f}\n"
             f"  target_direction: {target_direction['action_name']}, "
-            f"world_yaw_rad={target_direction['world_yaw_rad']:.6f}\n"
+            f"odom={target_direction['odom_direction']}, "
+            f"target_yaw={target_direction['target_yaw']:.6f}\n"
+            f"  target_pose: x={target_pose['x']:.6f}, "
+            f"y={target_pose['y']:.6f}, yaw_rad={target_pose['yaw_rad']:.6f}\n"
             f"  target_distance: {result['target_distance']:.6f}"
+        )
+
+    def update_rotation_result(
+        self,
+        final_yaw: float,
+        yaw_error: float,
+        success: bool,
+    ) -> None:
+        if self.experiment_result is None:
+            return
+        self.experiment_result.update(
+            {
+                "final_yaw": float(final_yaw),
+                "rotate_success": bool(success),
+                "rotate_error": float(yaw_error),
+                "rotate_error_deg": math.degrees(yaw_error),
+            }
         )
 
     def save_experiment_result(self) -> Path:
@@ -294,6 +390,7 @@ class RealcarStepOnceSafeNode(Node):
         start_pose = result["start_pose"]
         end_pose = result["end_pose"]
         target_direction = result["target_direction"]
+        target_pose = result["target_pose"]
         end_pose_text = "null"
         if end_pose is not None:
             end_pose_text = (
@@ -310,12 +407,20 @@ class RealcarStepOnceSafeNode(Node):
             "step_experiment_result:\n"
             f"  timestamp: {result['timestamp']}\n"
             f"  action_idx: {result['action_idx']}\n"
+            f"  motion_mode: {result['motion_mode']}\n"
             f"  start_pose: x={start_pose['x']:.6f}, y={start_pose['y']:.6f}, "
             f"yaw_rad={start_pose['yaw_rad']:.6f}\n"
             f"  end_pose: {end_pose_text}\n"
             f"  target_direction: {target_direction['action_name']}, "
-            f"world_yaw_rad={target_direction['world_yaw_rad']:.6f}\n"
+            f"odom={target_direction['odom_direction']}, "
+            f"target_yaw={result['target_yaw']:.6f}\n"
+            f"  target_pose: x={target_pose['x']:.6f}, "
+            f"y={target_pose['y']:.6f}, yaw_rad={target_pose['yaw_rad']:.6f}\n"
             f"  target_distance: {result['target_distance']:.6f}\n"
+            f"  rotate_start_yaw: {result['rotate_start_yaw']:.6f}\n"
+            f"  final_yaw: {result['final_yaw']:.6f}\n"
+            f"  rotate_success: {str(result['rotate_success']).lower()}\n"
+            f"  rotate_error: {result['rotate_error']:.6f}\n"
             f"  actual_displacement: {actual_distance_text}\n"
             f"  duration: {result['duration']:.3f}\n"
             f"  success: {str(result['success']).lower()}\n"
@@ -466,40 +571,45 @@ class RealcarStepOnceSafeNode(Node):
         self,
         x0: float,
         y0: float,
-        yaw0: float,
-    ) -> tuple[float, float, float, float]:
-        dr, dc = ACTIONS_8[self.action_idx]
-
-        rel_forward = float(dc) * self.step_distance
-        rel_left = float(-dr) * self.step_distance
-
-        tx = x0 + rel_forward * math.cos(yaw0) - rel_left * math.sin(yaw0)
-        ty = y0 + rel_forward * math.sin(yaw0) + rel_left * math.cos(yaw0)
-
-        return tx, ty, rel_forward, rel_left
-
-    def execute_target(self, tx: float, ty: float) -> None:
-        x0, y0, yaw0, _ = self.pose_xy_yaw_time()
-
-        self.get_logger().warn(
-            "EXECUTE START: publishing /cmd_vel at low speed. "
-            "Keep emergency stop ready."
+    ) -> ActionExecutionTarget:
+        return self.action_adapter.target_for_action(
+            self.action_idx,
+            start_x=x0,
+            start_y=y0,
+            step_distance=self.step_distance,
         )
 
+    def bounded_angular_velocity(self, yaw_error: float, gain: float) -> float:
+        wz = max(-self.rotate_max_w, min(self.rotate_max_w, gain * yaw_error))
+        if abs(yaw_error) < self.rotate_tol:
+            return 0.0
+        if abs(wz) < self.rotate_min_w:
+            return math.copysign(self.rotate_min_w, wz)
+        return wz
+
+    def execute_safe_rotate_drive(self, target: ActionExecutionTarget) -> None:
         self.get_logger().info("rotate phase start")
         rotate_wall_start = time.monotonic()
         last_debug = -1.0e9
         stable_count = 0
+        initial_yaw = self.pose_xy_yaw_time()[2]
+        best_abs_error = abs(norm_angle(target.target_yaw - initial_yaw))
+        last_progress_wall = rotate_wall_start
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
             x, y, yaw, _ = self.pose_xy_yaw_time()
-
-            target_yaw = math.atan2(ty - y, tx - x)
-            err = norm_angle(target_yaw - yaw)
+            err = norm_angle(target.target_yaw - yaw)
             wall_elapsed = time.monotonic() - rotate_wall_start
+            abs_error = abs(err)
+            within_tolerance = abs(err) < self.rotate_tol
+            self.update_rotation_result(yaw, err, within_tolerance)
 
-            if abs(err) < self.rotate_tol:
+            if abs_error <= best_abs_error - self.rotate_min_progress:
+                best_abs_error = abs_error
+                last_progress_wall = time.monotonic()
+
+            if within_tolerance:
                 stable_count += 1
                 if stable_count >= 5:
                     break
@@ -507,23 +617,57 @@ class RealcarStepOnceSafeNode(Node):
                 stable_count = 0
 
             if wall_elapsed > self.rotate_wall_timeout:
-                raise RuntimeError(f"rotate timeout, yaw_err={math.degrees(err):.1f}deg")
+                raise RuntimeError(
+                    "rotate timeout, "
+                    "start_yaw="
+                    f"{math.degrees(self.experiment_result['rotate_start_yaw']):.1f}deg, "
+                    f"target_yaw={math.degrees(target.target_yaw):.1f}deg, "
+                    f"final_yaw={math.degrees(yaw):.1f}deg, "
+                    f"yaw_err={math.degrees(err):.1f}deg"
+                )
+            progress_age = time.monotonic() - last_progress_wall
+            if not within_tolerance and progress_age > self.rotate_progress_timeout:
+                raise RuntimeError(
+                    "rotate no progress, "
+                    f"progress_age={progress_age:.1f}s, "
+                    f"best_yaw_err={math.degrees(best_abs_error):.1f}deg, "
+                    f"current_yaw_err={math.degrees(abs_error):.1f}deg"
+                )
 
-            wz = max(-self.rotate_max_w, min(self.rotate_max_w, self.rotate_kp * err))
-            if abs(wz) < self.rotate_min_w:
-                wz = math.copysign(self.rotate_min_w, wz)
+            wz = self.bounded_angular_velocity(err, self.rotate_kp)
 
             if wall_elapsed - last_debug >= self.control_debug_period:
                 last_debug = wall_elapsed
                 self.get_logger().info(
                     f"rotate_debug xy=({x:.3f},{y:.3f}) yaw={math.degrees(yaw):+.1f}deg "
-                    f"target_yaw={math.degrees(target_yaw):+.1f}deg "
-                    f"err={math.degrees(err):+.1f}deg wz={wz:+.3f}"
+                    f"target_yaw={math.degrees(target.target_yaw):+.1f}deg "
+                    f"err={math.degrees(err):+.1f}deg wz={wz:+.3f} "
+                    f"stable={stable_count} progress_age={progress_age:.1f}s"
                 )
 
             self.publish_velocity(0.0, wz)
 
         self.stop()
+        _, _, rotate_final_yaw, _ = self.pose_xy_yaw_time()
+        rotate_error = norm_angle(target.target_yaw - rotate_final_yaw)
+        rotate_success = abs(rotate_error) < self.rotate_tol
+        self.update_rotation_result(
+            rotate_final_yaw,
+            rotate_error,
+            rotate_success,
+        )
+        self.get_logger().warn(
+            "rotate_result "
+            f"rotate_start_yaw={math.degrees(self.experiment_result['rotate_start_yaw']):+.1f}deg "
+            f"target_yaw={math.degrees(target.target_yaw):+.1f}deg "
+            f"final_yaw={math.degrees(rotate_final_yaw):+.1f}deg "
+            f"yaw_error={math.degrees(rotate_error):+.1f}deg "
+            f"rotate_success={str(rotate_success).lower()}"
+        )
+        if not rotate_success:
+            raise RuntimeError(
+                f"rotate settle error, yaw_err={math.degrees(rotate_error):.1f}deg"
+            )
 
         self.get_logger().info("drive phase start")
         drive_wall_start = time.monotonic()
@@ -533,7 +677,7 @@ class RealcarStepOnceSafeNode(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             x, y, yaw, _ = self.pose_xy_yaw_time()
 
-            dist = math.hypot(tx - x, ty - y)
+            dist = math.hypot(target.target_x - x, target.target_y - y)
             wall_elapsed = time.monotonic() - drive_wall_start
 
             if dist <= self.target_pos_tol:
@@ -542,7 +686,7 @@ class RealcarStepOnceSafeNode(Node):
             if wall_elapsed > self.drive_wall_timeout:
                 raise RuntimeError(f"drive timeout, dist={dist:.3f}m")
 
-            target_yaw = math.atan2(ty - y, tx - x)
+            target_yaw = math.atan2(target.target_y - y, target.target_x - x)
             yaw_err = norm_angle(target_yaw - yaw)
             wz = max(-0.12, min(0.12, 0.8 * yaw_err))
 
@@ -550,7 +694,8 @@ class RealcarStepOnceSafeNode(Node):
                 last_debug = wall_elapsed
                 self.get_logger().info(
                     f"drive_debug xy=({x:.3f},{y:.3f}) yaw={math.degrees(yaw):+.1f}deg "
-                    f"target=({tx:.3f},{ty:.3f}) dist={dist:.3f} "
+                    f"target=({target.target_x:.3f},{target.target_y:.3f}) "
+                    f"dist={dist:.3f} "
                     f"vx={self.linear_speed:+.3f} wz={wz:+.3f}"
                 )
 
@@ -562,9 +707,87 @@ class RealcarStepOnceSafeNode(Node):
         self.get_logger().warn(
             f"EXECUTE DONE: final_xy=({x1:.3f},{y1:.3f}) "
             f"final_yaw={math.degrees(yaw1):+.1f}deg "
-            f"target_xy=({tx:.3f},{ty:.3f}) "
-            f"final_dist={math.hypot(tx-x1, ty-y1):.3f}m"
+            f"target_xy=({target.target_x:.3f},{target.target_y:.3f}) "
+            f"final_dist={math.hypot(target.target_x-x1, target.target_y-y1):.3f}m"
         )
+
+    def execute_adapter_drive(self, target: ActionExecutionTarget) -> None:
+        self.get_logger().info(
+            "adapter drive phase start "
+            f"heading_stop_deg={self.adapter_heading_stop_deg:.1f} "
+            f"timeout={self.adapter_drive_wall_timeout:.1f}s"
+        )
+        drive_wall_start = time.monotonic()
+        last_debug = -1.0e9
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.05)
+            x, y, yaw, _ = self.pose_xy_yaw_time()
+            dx = target.target_x - x
+            dy = target.target_y - y
+            dist = math.hypot(dx, dy)
+            wall_elapsed = time.monotonic() - drive_wall_start
+            fixed_yaw_error = norm_angle(target.target_yaw - yaw)
+            rotate_success = abs(fixed_yaw_error) < self.rotate_tol
+            self.update_rotation_result(yaw, fixed_yaw_error, rotate_success)
+
+            if dist <= self.target_pos_tol:
+                break
+            if wall_elapsed > self.adapter_drive_wall_timeout:
+                raise RuntimeError(
+                    "adapter drive timeout, "
+                    f"dist={dist:.3f}m, "
+                    f"yaw_err={math.degrees(fixed_yaw_error):.1f}deg"
+                )
+
+            drive_yaw = math.atan2(dy, dx)
+            drive_yaw_error = norm_angle(drive_yaw - yaw)
+            wz = self.bounded_angular_velocity(
+                drive_yaw_error,
+                self.adapter_angular_kp,
+            )
+            if abs(drive_yaw_error) >= self.adapter_heading_stop:
+                vx = 0.0
+            else:
+                vx = self.linear_speed * max(0.0, math.cos(drive_yaw_error))
+
+            if wall_elapsed - last_debug >= self.control_debug_period:
+                last_debug = wall_elapsed
+                self.get_logger().info(
+                    "adapter_drive_debug "
+                    f"xy=({x:.3f},{y:.3f}) yaw={math.degrees(yaw):+.1f}deg "
+                    f"target=({target.target_x:.3f},{target.target_y:.3f}) "
+                    f"dist={dist:.3f} "
+                    f"drive_yaw={math.degrees(drive_yaw):+.1f}deg "
+                    f"yaw_err={math.degrees(drive_yaw_error):+.1f}deg "
+                    f"vx={vx:+.3f} wz={wz:+.3f}"
+                )
+            self.publish_velocity(vx, wz)
+
+        self.stop()
+        x1, y1, yaw1, _ = self.pose_xy_yaw_time()
+        fixed_yaw_error = norm_angle(target.target_yaw - yaw1)
+        rotate_success = abs(fixed_yaw_error) < self.rotate_tol
+        self.update_rotation_result(yaw1, fixed_yaw_error, rotate_success)
+        self.get_logger().warn(
+            "ADAPTER EXECUTE DONE: "
+            f"final_xy=({x1:.3f},{y1:.3f}) "
+            f"final_yaw={math.degrees(yaw1):+.1f}deg "
+            f"target_xy=({target.target_x:.3f},{target.target_y:.3f}) "
+            f"final_dist={math.hypot(target.target_x-x1, target.target_y-y1):.3f}m "
+            f"rotate_success={str(rotate_success).lower()} "
+            f"rotate_error={math.degrees(fixed_yaw_error):+.1f}deg"
+        )
+
+    def execute_target(self, target: ActionExecutionTarget) -> None:
+        self.get_logger().warn(
+            "EXECUTE START: publishing /cmd_vel at low speed. "
+            f"motion_mode={self.motion_mode}. Keep emergency stop ready."
+        )
+        if self.motion_mode == "safe_rotate_drive":
+            self.execute_safe_rotate_drive(target)
+            return
+        self.execute_adapter_drive(target)
 
     def timer_cb(self) -> None:
         if self.done:
@@ -575,24 +798,20 @@ class RealcarStepOnceSafeNode(Node):
 
         try:
             x, y, yaw, _ = self.pose_xy_yaw_time()
-            tx, ty, rel_forward, rel_left = self.target_for_action(x, y, yaw)
+            target = self.target_for_action(x, y)
             start_pose = self.pose_record()
-            self.begin_experiment(
-                start_pose,
-                tx,
-                ty,
-                rel_forward,
-                rel_left,
-            )
+            self.begin_experiment(start_pose, target)
             self.log_experiment_start()
 
             self.get_logger().warn(
                 "step_once_plan "
                 f"execute={self.execute} "
+                f"motion_mode={self.motion_mode} "
                 f"action={self.action_idx}:{ACTION_NAMES[self.action_idx]} "
                 f"start_xy=({x:.3f},{y:.3f}) yaw={math.degrees(yaw):+.1f}deg "
-                f"rel_forward={rel_forward:+.3f} rel_left={rel_left:+.3f} "
-                f"target_xy=({tx:.3f},{ty:.3f})"
+                f"odom_direction={target.odom_direction} "
+                f"odom_delta=({target.odom_dx:+.3f},{target.odom_dy:+.3f}) "
+                f"target_xy=({target.target_x:.3f},{target.target_y:.3f})"
             )
 
             if not self.execute:
@@ -604,7 +823,7 @@ class RealcarStepOnceSafeNode(Node):
             if self.cmd_pub.get_subscription_count() < 1:
                 raise RuntimeError("No /cmd_vel subscriber found")
 
-            self.execute_target(tx, ty)
+            self.execute_target(target)
             self.finish_experiment(True, None)
             self.done = True
 

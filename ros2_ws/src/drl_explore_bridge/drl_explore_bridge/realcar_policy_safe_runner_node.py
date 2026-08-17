@@ -165,6 +165,7 @@ class RealcarPolicySafeRunner(Node):
         self.allowed_actions_mode = str(self.get_parameter("allowed_actions_mode").value)
         self.diagonal_mode = str(self.get_parameter("diagonal_mode").value)
         self.min_sector_dist = float(self.get_parameter("min_sector_dist").value)
+        self.cell_size = 0.35
 
         if self.allowed_actions_mode not in ("front3", "all8"):
             raise ValueError("allowed_actions_mode must be 'front3' or 'all8'")
@@ -212,7 +213,23 @@ class RealcarPolicySafeRunner(Node):
         if self.sensor_future_tolerance_sec < 0.0:
             raise ValueError("sensor_future_tolerance_sec must be >= 0")
 
-        self.cell_size = 0.35
+        if self.max_steps > 1 and not math.isclose(
+            self.step_distance,
+            self.cell_size,
+            rel_tol=0.01,
+            abs_tol=0.005,
+        ):
+            warning = (
+                "MULTI-STEP CONFIGURATION BLOCKED: "
+                f"max_steps={self.max_steps}, "
+                f"step_distance={self.step_distance:.3f}m, "
+                f"DRL cell_size={self.cell_size:.3f}m. "
+                "The physical step and DRL state update would diverge; "
+                "set max_steps:=1 or make step_distance match cell_size."
+            )
+            self.get_logger().warn(warning)
+            raise ValueError(warning)
+
         self.scan_radius_cells = 10
         self.local_size = 2 * self.scan_radius_cells + 1
         self.center = self.scan_radius_cells
