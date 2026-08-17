@@ -18,6 +18,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     belief_statistics,
     clearance_gate_passed,
     dynamic_obstacle_should_stop,
+    episode_success_for_reason,
     expected_grid_state_from_action,
     frontier_exhausted,
     grid_transition_matches,
@@ -26,6 +27,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     motion_is_permitted,
     repeated_state_deadlock,
     required_motion_clearance,
+    successful_step_termination_reason,
     validate_commissioning_config,
 )
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
@@ -242,6 +244,28 @@ def test_commissioning_reaches_policy_inference_before_step_cap():
         },
     )()
     assert not RealcarPolicyContinuousRunner._completion_enabled(harness)
+
+
+def test_successful_commissioning_has_successful_completion_semantics():
+    reason = successful_step_termination_reason(True)
+    assert reason == "commissioning_complete"
+    assert episode_success_for_reason(True, reason)
+
+
+def test_blocked_commissioning_is_not_successful():
+    assert not episode_success_for_reason(
+        True,
+        "commissioning_action_blocked",
+    )
+
+
+def test_normal_max_steps_is_not_successful():
+    assert successful_step_termination_reason(False) is None
+    assert not episode_success_for_reason(False, "max_steps_reached")
+
+
+def test_frontier_exhaustion_remains_normal_continuous_success():
+    assert episode_success_for_reason(False, "frontier_exhausted")
 
 
 @pytest.mark.parametrize("action_idx", (-1, 8, 99))

@@ -208,6 +208,25 @@ def action_source_for_mode(commissioning_mode: bool) -> str:
     return "policy"
 
 
+def successful_step_termination_reason(
+    commissioning_mode: bool,
+) -> Optional[str]:
+    """Return the dedicated completion reason for a successful commission."""
+    if commissioning_mode:
+        return "commissioning_complete"
+    return None
+
+
+def episode_success_for_reason(
+    commissioning_mode: bool,
+    exit_reason: str,
+) -> bool:
+    """Classify normal exploration and commissioning success separately."""
+    if commissioning_mode:
+        return exit_reason == "commissioning_complete"
+    return exit_reason == "frontier_exhausted"
+
+
 def hard_limit_termination(
     completed_steps: int,
     max_steps: int,
@@ -640,7 +659,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             return
         self.result_write_attempted = True
         steps = self.experiment_result["steps"]
-        success = exit_reason == "frontier_exhausted"
+        success = episode_success_for_reason(
+            self.commissioning_mode,
+            exit_reason,
+        )
         duration = time.monotonic() - self.experiment_started_monotonic
         self._episode_travel_distance = sum(
             float(step["actual_distance"])
@@ -1003,6 +1025,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 recent_positions = recent_positions[-8:]
                 self.finish_step_record(record, step_started, True, None)
                 self._log_continuous_step(record)
+                successful_termination = successful_step_termination_reason(
+                    self.commissioning_mode
+                )
+                if successful_termination is not None:
+                    return successful_termination
 
             except KeyboardInterrupt:
                 self.stop()
