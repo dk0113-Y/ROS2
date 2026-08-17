@@ -12,14 +12,20 @@ from drl_explore_bridge.realcar_action_adapter import RealcarActionAdapter
 from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     CONTINUOUS_CELL_SIZE_M,
     CONTINUOUS_DEFAULT_MAX_STEPS,
+    DEFAULT_FOOTPRINT_RADIUS_M,
+    DEFAULT_LASER_X_IN_BASE_M,
+    DEFAULT_LASER_Y_IN_BASE_M,
+    DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M,
+    DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M,
     ContinuousPreMotionPlan,
     DriveSensorCycleTimeout,
     DynamicObstacleStop,
+    FootprintCheck,
     RealcarPolicyContinuousRunner,
+    RotationFootprintBlocked,
     action_source_for_mode,
     belief_statistics,
-    clearance_gate_passed,
-    dynamic_obstacle_should_stop,
+    capsule_footprint_check,
     drive_sensor_sequence_progress,
     episode_success_for_reason,
     expected_grid_state_from_action,
@@ -29,7 +35,8 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     known_area_stagnated,
     motion_is_permitted,
     repeated_state_deadlock,
-    required_motion_clearance,
+    scan_capsule_footprint_check,
+    scan_points_in_base,
     successful_step_termination_reason,
     validate_commissioning_config,
 )
@@ -67,6 +74,18 @@ def make_scan(distance):
     return scan
 
 
+def make_single_hit_scan(distance, angle=0.0):
+    """Create a scan containing one valid hit at an exact angle."""
+    scan = LaserScan()
+    scan.angle_min = angle
+    scan.angle_increment = 1.0
+    scan.range_min = 0.05
+    scan.range_max = 10.0
+    scan.ranges = [float(distance)]
+    scan.header.stamp.sec = 100
+    return scan
+
+
 class PlanHarness:
     """Supply only the action and scan methods needed by plan selection."""
 
@@ -80,7 +99,15 @@ class PlanHarness:
         self.cell_size = CONTINUOUS_CELL_SIZE_M
         self.min_sector_dist = 0.25
         self.motion_clearance_margin = 0.25
+        self.footprint_radius_m = DEFAULT_FOOTPRINT_RADIUS_M
+        self.longitudinal_extra_margin_m = (
+            DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M
+        )
         self.distances = distances
+        self.action_yaws = {
+            self.target_for_action(index, 0.0, 0.0).target_yaw: index
+            for index in range(8)
+        }
 
     def pose_record_from_odom(self, odom):
         """Reuse the production pose conversion."""
@@ -95,10 +122,27 @@ class PlanHarness:
             step_distance=self.cell_size,
         )
 
-    def action_sector_min(self, action_idx, scan, odom):
-        """Return deterministic per-action clearance for a pure test."""
-        del scan, odom
-        return self.distances[action_idx]
+    def pre_motion_footprint_check(self, target, pose, scan):
+        """Return deterministic per-action capsule results for plan tests."""
+        del scan
+        action_idx = self.action_yaws[target.target_yaw]
+        target_distance = math.hypot(
+            target.target_x - pose["x"],
+            target.target_y - pose["y"],
+        )
+        front_edge = (
+            target_distance
+            + self.longitudinal_extra_margin_m
+            + self.footprint_radius_m
+        )
+        clearance = self.distances[action_idx] - front_edge
+        passed = clearance >= 0.0
+        return FootprintCheck(
+            passed,
+            clearance,
+            None if passed else "longitudinal_path_obstruction",
+            1,
+        )
 
 
 class BeliefHarness:
@@ -115,25 +159,28 @@ class BeliefHarness:
 class DynamicHarness:
     """Capture the immediate-stop behavior without constructing a ROS node."""
 
-    def __init__(self, distance):
+    def __init__(self, distance, angle=0.0):
         self._sensor_condition = threading.Condition()
         self.scan_sequence = 2
         self._last_dynamic_scan_sequence = 1
-        self.latest_scan = make_scan(distance)
+        self.latest_scan = make_single_hit_scan(distance, angle)
         self.latest_scan_received_at = 1.0
         self.scan_timeout_sec = 0.5
         self.dynamic_stop_distance = 0.25
-        self._dynamic_step_record = {"dynamic_obstacle_stop": False}
+        self.footprint_radius_m = DEFAULT_FOOTPRINT_RADIUS_M
+        self.dynamic_forward_center_line_extension_m = 0.05
+        self.laser_x_in_base_m = 0.0
+        self.laser_y_in_base_m = 0.0
+        self.laser_yaw_in_base = 0.0
+        self._dynamic_step_record = {
+            "dynamic_obstacle_stop": False,
+            "dynamic_footprint_stop": False,
+        }
         self.stop_calls = 0
 
     def require_fresh_sensor(self, *args):
         """Treat the fabricated scan as fresh."""
         del args
-
-    def sector_min_dist(self, scan, center, width):
-        """Return the fabricated uniform scan distance."""
-        del center, width
-        return float(scan.ranges[0])
 
     def stop(self, repeat=10):
         """Record the zero-command stop request."""
@@ -232,8 +279,74 @@ class DriveCycleHarness:
         self.stop_calls += 1
 
 
+class RotationHarness:
+    """Exercise the all-around rotation footprint gate."""
+
+    def __init__(self, distance):
+        self._sensor_condition = threading.Condition()
+        self.latest_scan = make_scan(distance)
+        self.latest_scan_received_at = 1.0
+        self.scan_timeout_sec = 0.5
+        self.footprint_radius_m = DEFAULT_FOOTPRINT_RADIUS_M
+        self.laser_x_in_base_m = 0.0
+        self.laser_y_in_base_m = 0.0
+        self.laser_yaw_in_base = 0.0
+        self._dynamic_step_record = {
+            "rotation_footprint_passed": None,
+            "rotation_nearest_footprint_clearance": None,
+        }
+        self.stop_calls = 0
+
+    def require_fresh_sensor(self, *args):
+        """Treat the fabricated scan as fresh."""
+        del args
+
+    def rotation_footprint_check(self, scan):
+        """Reuse the production circular check."""
+        return RealcarPolicyContinuousRunner.rotation_footprint_check(
+            self,
+            scan,
+        )
+
+    def stop(self, repeat=10):
+        """Record the zero-command stop request."""
+        del repeat
+        self.stop_calls += 1
+
+
 def test_continuous_cell_size_is_035():
     assert CONTINUOUS_CELL_SIZE_M == pytest.approx(0.35)
+
+
+def test_continuous_footprint_defaults_define_040_corridor():
+    assert DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M == pytest.approx(0.40)
+    assert DEFAULT_FOOTPRINT_RADIUS_M == pytest.approx(0.20)
+    assert DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M == pytest.approx(0.05)
+    assert 2.0 * DEFAULT_FOOTPRINT_RADIUS_M == pytest.approx(
+        DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M
+    )
+
+
+def test_legacy_margin_cannot_conflict_with_footprint_geometry():
+    harness = type(
+        "FootprintParameterHarness",
+        (),
+        {
+            "cell_size": 0.35,
+            "step_distance": 0.35,
+            "diagonal_mode": "grid_center",
+            "all8_action_mode": True,
+            "max_runtime_sec": 1.0,
+            "motion_clearance_margin": 0.25,
+            "dynamic_stop_distance": 0.25,
+            "nominal_min_corridor_width_m": 0.40,
+            "footprint_radius_m": 0.20,
+            "longitudinal_extra_margin_m": 0.04,
+            "dynamic_forward_center_line_extension_m": 0.05,
+        },
+    )()
+    with pytest.raises(ValueError, match="legacy motion_clearance_margin"):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
 
 
 def test_continuous_default_step_distance_is_cell_size():
@@ -298,25 +411,123 @@ def test_sub_half_cell_motion_does_not_advance_grid_state():
     assert odom_delta_to_grid_offset(0.174, 0.0, 0.35) == (0, 0)
 
 
-def test_cardinal_required_clearance_includes_target_and_margin():
-    assert required_motion_clearance(0.35, 0.25, 0.25) == pytest.approx(0.60)
+@pytest.mark.parametrize(
+    ("corridor_width", "expected_passed"),
+    ((0.38, False), (0.40, True), (0.42, True)),
+)
+def test_nominal_corridor_width_boundary(corridor_width, expected_passed):
+    half_width = corridor_width / 2.0
+    points = [(0.10, half_width), (0.30, -half_width)]
+    result = capsule_footprint_check(points, 0.0, 0.40, 0.20)
+    assert result.passed is expected_passed
+    assert result.nearest_capsule_clearance == pytest.approx(
+        half_width - 0.20
+    )
 
 
-def test_diagonal_required_clearance_is_greater_than_cardinal():
-    cardinal = required_motion_clearance(0.35, 0.25, 0.25)
-    diagonal = required_motion_clearance(math.sqrt(2.0) * 0.35, 0.25, 0.25)
-    assert diagonal > cardinal
-    assert diagonal == pytest.approx(0.7449747468)
+def test_040_corridor_is_not_rejected_by_old_sector_min_semantics():
+    points = [
+        (0.30, -0.20),
+        (0.30, 0.20),
+        (0.55, -0.20),
+        (0.55, 0.20),
+    ]
+    old_sector_hit = math.hypot(0.55, 0.20)
+    old_sector_angle = math.atan2(0.20, 0.55)
+    assert old_sector_angle < math.radians(22.5)
+    assert old_sector_hit < 0.60
+    result = capsule_footprint_check(points, 0.0, 0.40, 0.20)
+    assert result.passed
+    assert result.nearest_capsule_clearance == pytest.approx(0.0)
 
 
-def test_old_fixed_threshold_is_not_enough_for_cardinal_motion():
-    required = required_motion_clearance(0.35, 0.25, 0.25)
-    assert not clearance_gate_passed(0.30, required)
+def test_rejection_diagnostics_distinguish_path_from_corridor():
+    path_result = capsule_footprint_check(
+        [(0.599, 0.0)],
+        0.0,
+        0.40,
+        0.20,
+    )
+    corridor_result = capsule_footprint_check(
+        [(0.30, 0.19)],
+        0.0,
+        0.40,
+        0.20,
+    )
+    assert path_result.obstruction_type == "longitudinal_path_obstruction"
+    assert corridor_result.obstruction_type == (
+        "footprint_corridor_obstruction"
+    )
 
 
-def test_sufficient_distance_aware_clearance_passes():
-    required = required_motion_clearance(0.35, 0.25, 0.25)
-    assert clearance_gate_passed(0.80, required)
+def test_scan_hits_are_transformed_with_verified_laser_translation():
+    scan = LaserScan()
+    scan.angle_min = 0.0
+    scan.angle_increment = 1.0
+    scan.range_min = 0.05
+    scan.range_max = 10.0
+    scan.ranges = [1.0]
+    points = scan_points_in_base(
+        scan,
+        DEFAULT_LASER_X_IN_BASE_M,
+        DEFAULT_LASER_Y_IN_BASE_M,
+        0.0,
+    )
+    assert points == pytest.approx(
+        [(1.0 + DEFAULT_LASER_X_IN_BASE_M, DEFAULT_LASER_Y_IN_BASE_M)]
+    )
+
+
+@pytest.mark.parametrize(
+    ("distance", "expected_passed"),
+    ((0.599, False), (0.600, True), (0.601, True)),
+)
+def test_cardinal_capsule_preserves_060_front_edge(
+    distance,
+    expected_passed,
+):
+    result = capsule_footprint_check([(distance, 0.0)], 0.0, 0.40, 0.20)
+    assert result.passed is expected_passed
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected_passed"),
+    ((-0.001, False), (0.0, True), (0.001, True)),
+)
+def test_diagonal_capsule_preserves_0745_front_edge(
+    offset,
+    expected_passed,
+):
+    center_line = math.sqrt(2.0) * 0.35 + 0.05
+    front_edge = center_line + 0.20
+    distance = front_edge + offset
+    point = (
+        distance * math.cos(math.pi / 4.0),
+        distance * math.sin(math.pi / 4.0),
+    )
+    result = capsule_footprint_check(
+        [point],
+        math.pi / 4.0,
+        center_line,
+        0.20,
+    )
+    assert front_edge == pytest.approx(0.7449747468)
+    assert result.passed is expected_passed
+
+
+def test_scan_capsule_fails_safe_without_valid_hits():
+    scan = make_scan(float("inf"))
+    result = scan_capsule_footprint_check(
+        scan,
+        0.0,
+        0.40,
+        0.20,
+        DEFAULT_LASER_X_IN_BASE_M,
+        DEFAULT_LASER_Y_IN_BASE_M,
+        0.0,
+    )
+    assert not result.passed
+    assert result.obstruction_type == "invalid_scan"
 
 
 def test_normal_mode_keeps_policy_action_source_and_fallback_behavior():
@@ -478,7 +689,7 @@ def test_commissioning_action_does_not_override_odom_derived_state():
     assert not grid_transition_matches(expected, actual)
 
 
-def test_distance_aware_plan_falls_back_and_rebuilds_target():
+def test_footprint_aware_plan_falls_back_and_rebuilds_target():
     harness = PlanHarness({1: 0.70, 2: 0.80})
     plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
         harness,
@@ -496,7 +707,7 @@ def test_distance_aware_plan_falls_back_and_rebuilds_target():
     assert plan.target_distance == pytest.approx(0.35)
 
 
-def test_no_distance_aware_safe_action_has_no_executed_action():
+def test_no_footprint_aware_safe_action_has_no_executed_action():
     harness = PlanHarness({1: 0.30, 2: 0.40})
     plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
         harness,
@@ -507,20 +718,63 @@ def test_no_distance_aware_safe_action_has_no_executed_action():
     )
     assert not plan.gate_passed
     assert plan.executed_action is None
+    assert plan.obstruction_type == "longitudinal_path_obstruction"
     assert not motion_is_permitted(True, plan.gate_passed, plan.executed_action)
 
 
-def test_dynamic_stop_predicate_blocks_close_obstacle():
-    assert dynamic_obstacle_should_stop(0.20, 0.25)
-    assert not dynamic_obstacle_should_stop(0.30, 0.25)
-
-
 def test_drive_dynamic_gate_stops_before_motion_can_continue():
-    harness = DynamicHarness(0.20)
-    with pytest.raises(DynamicObstacleStop, match="dynamic_obstacle_stop"):
+    harness = DynamicHarness(0.199, math.pi / 2.0)
+    with pytest.raises(DynamicObstacleStop, match="dynamic_footprint_stop"):
         RealcarPolicyContinuousRunner.check_drive_dynamic_safety(harness)
     assert harness.stop_calls == 1
     assert harness._dynamic_step_record["dynamic_obstacle_stop"]
+    assert harness._dynamic_step_record["dynamic_footprint_stop"]
+
+
+def test_drive_dynamic_gate_allows_nominal_040_corridor_wall():
+    harness = DynamicHarness(0.20, math.pi / 2.0)
+    RealcarPolicyContinuousRunner.check_drive_dynamic_safety(harness)
+    assert harness.stop_calls == 0
+    assert not harness._dynamic_step_record["dynamic_footprint_stop"]
+
+
+@pytest.mark.parametrize(
+    ("points", "expected_passed"),
+    (
+        ([(0.0, 0.199)], False),
+        ([(0.0, 0.200)], True),
+        ([(0.0, 0.201)], True),
+        ([(0.249, 0.0)], False),
+        ([(0.250, 0.0)], True),
+        ([(0.251, 0.0)], True),
+    ),
+)
+def test_drive_dynamic_capsule_keeps_side_and_front_thresholds(
+    points,
+    expected_passed,
+):
+    result = capsule_footprint_check(points, 0.0, 0.05, 0.20)
+    assert result.passed is expected_passed
+
+
+def test_rotation_footprint_blocks_inside_radius_before_rotate():
+    harness = RotationHarness(0.199)
+    with pytest.raises(
+        RotationFootprintBlocked,
+        match="rotation_footprint_blocked",
+    ):
+        RealcarPolicyContinuousRunner.check_rotation_footprint_safety(
+            harness
+        )
+    assert harness.stop_calls == 1
+    assert not harness._dynamic_step_record["rotation_footprint_passed"]
+
+
+def test_rotation_footprint_allows_obstacles_outside_radius():
+    harness = RotationHarness(0.201)
+    RealcarPolicyContinuousRunner.check_rotation_footprint_safety(harness)
+    assert harness.stop_calls == 0
+    assert harness._dynamic_step_record["rotation_footprint_passed"]
 
 
 def test_drive_cycle_with_only_odom_update_cannot_continue():

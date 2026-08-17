@@ -31,6 +31,7 @@ from drl_explore_bridge.realcar_policy_safe_runner_node import (
     SensorRefreshBarrier,
     format_optional_float,
     load_policy_model,
+    norm_angle,
     odom_delta_to_grid_offset,
     sensor_sample_is_after_barrier,
 )
@@ -41,10 +42,20 @@ CONTINUOUS_DEFAULT_MAX_STEPS = 30
 CONTINUOUS_MAX_STEPS_LIMIT = 1000
 DEFAULT_MOTION_CLEARANCE_MARGIN_M = 0.25
 DEFAULT_DYNAMIC_STOP_DISTANCE_M = 0.25
+DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M = 0.40
+DEFAULT_FOOTPRINT_RADIUS_M = 0.20
+DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M = 0.05
+DEFAULT_LASER_X_IN_BASE_M = 0.03163
+DEFAULT_LASER_Y_IN_BASE_M = 0.00009
+FOOTPRINT_COMPARISON_TOLERANCE_M = 1.0e-9
 
 
 class DynamicObstacleStop(RuntimeError):
     """Signal that a fresh drive-phase scan requires an immediate stop."""
+
+
+class RotationFootprintBlocked(RuntimeError):
+    """Signal that the full rotation footprint is not clear."""
 
 
 class DriveSensorCycleTimeout(RuntimeError):
@@ -60,53 +71,122 @@ class ContinuousPreMotionPlan:
     target: Optional[ActionExecutionTarget]
     pre_motion_pose: dict[str, float]
     target_distance: Optional[float]
-    observed_clearance: Optional[float]
-    required_clearance: Optional[float]
+    capsule_front_edge: Optional[float]
+    nearest_capsule_clearance: Optional[float]
+    pre_motion_footprint_passed: bool
+    obstruction_type: Optional[str]
     gate_passed: bool
     safety_fallback_used: bool
 
 
-def required_motion_clearance(
-    target_distance: float,
-    existing_minimum_clearance: float,
-    motion_clearance_margin: float,
-) -> float:
-    """Return the target-length-aware clearance threshold in metres."""
-    if target_distance < 0.0:
-        raise ValueError("target_distance must be >= 0")
-    if existing_minimum_clearance <= 0.0:
-        raise ValueError("existing_minimum_clearance must be > 0")
-    if motion_clearance_margin < 0.0:
-        raise ValueError("motion_clearance_margin must be >= 0")
-    return max(
-        existing_minimum_clearance,
-        target_distance + motion_clearance_margin,
+@dataclass(frozen=True)
+class FootprintCheck:
+    """Describe scan-point clearance from a swept circular footprint."""
+
+    passed: bool
+    nearest_capsule_clearance: Optional[float]
+    obstruction_type: Optional[str]
+    valid_point_count: int
+
+
+def scan_points_in_base(
+    scan: LaserScan,
+    laser_x_in_base: float,
+    laser_y_in_base: float,
+    laser_yaw_in_base: float,
+) -> list[tuple[float, float]]:
+    """Transform valid planar LaserScan hits into the base frame."""
+    points: list[tuple[float, float]] = []
+    for index, raw_range in enumerate(scan.ranges):
+        hit_range = float(raw_range)
+        if not (
+            math.isfinite(hit_range)
+            and float(scan.range_min) <= hit_range <= float(scan.range_max)
+        ):
+            continue
+        scan_yaw = scan.angle_min + index * scan.angle_increment
+        base_yaw = laser_yaw_in_base + scan_yaw
+        points.append(
+            (
+                laser_x_in_base + hit_range * math.cos(base_yaw),
+                laser_y_in_base + hit_range * math.sin(base_yaw),
+            )
+        )
+    return points
+
+
+def capsule_footprint_check(
+    points_in_base: Sequence[tuple[float, float]],
+    motion_yaw_in_base: float,
+    center_line_length: float,
+    footprint_radius: float,
+    comparison_tolerance: float = FOOTPRINT_COMPARISON_TOLERANCE_M,
+) -> FootprintCheck:
+    """Check scan points against a line-segment plus circular footprint."""
+    if center_line_length < 0.0:
+        raise ValueError("center_line_length must be >= 0")
+    if footprint_radius <= 0.0:
+        raise ValueError("footprint_radius must be > 0")
+    if comparison_tolerance < 0.0:
+        raise ValueError("comparison_tolerance must be >= 0")
+
+    cos_yaw = math.cos(motion_yaw_in_base)
+    sin_yaw = math.sin(motion_yaw_in_base)
+    nearest_clearance: Optional[float] = None
+    nearest_projection = 0.0
+    for point_x, point_y in points_in_base:
+        forward = point_x * cos_yaw + point_y * sin_yaw
+        lateral = -point_x * sin_yaw + point_y * cos_yaw
+        segment_forward = min(max(forward, 0.0), center_line_length)
+        distance = math.hypot(forward - segment_forward, lateral)
+        clearance = distance - footprint_radius
+        if nearest_clearance is None or clearance < nearest_clearance:
+            nearest_clearance = clearance
+            nearest_projection = forward
+
+    if nearest_clearance is None:
+        return FootprintCheck(False, None, "invalid_scan", 0)
+    if nearest_clearance >= -comparison_tolerance:
+        return FootprintCheck(
+            True,
+            nearest_clearance,
+            None,
+            len(points_in_base),
+        )
+    obstruction_type = "footprint_corridor_obstruction"
+    if (
+        center_line_length > 0.0
+        and nearest_projection >= center_line_length
+    ):
+        obstruction_type = "longitudinal_path_obstruction"
+    return FootprintCheck(
+        False,
+        nearest_clearance,
+        obstruction_type,
+        len(points_in_base),
     )
 
 
-def clearance_gate_passed(
-    observed_clearance: Optional[float],
-    required_clearance: float,
-) -> bool:
-    """Return whether a valid observed range meets the required clearance."""
-    return (
-        observed_clearance is not None
-        and math.isfinite(observed_clearance)
-        and observed_clearance >= required_clearance
-    )
-
-
-def dynamic_obstacle_should_stop(
-    observed_clearance: Optional[float],
-    emergency_stop_distance: float,
-) -> bool:
-    """Fail safe when a fresh forward sector is invalid or too close."""
-    if emergency_stop_distance <= 0.0:
-        raise ValueError("emergency_stop_distance must be > 0")
-    return (
-        observed_clearance is None
-        or not math.isfinite(observed_clearance)
-        or observed_clearance < emergency_stop_distance
+def scan_capsule_footprint_check(
+    scan: LaserScan,
+    motion_yaw_in_base: float,
+    center_line_length: float,
+    footprint_radius: float,
+    laser_x_in_base: float,
+    laser_y_in_base: float,
+    laser_yaw_in_base: float,
+) -> FootprintCheck:
+    """Transform a scan and evaluate its swept circular footprint."""
+    return capsule_footprint_check(
+        scan_points_in_base(
+            scan,
+            laser_x_in_base,
+            laser_y_in_base,
+            laser_yaw_in_base,
+        ),
+        motion_yaw_in_base,
+        center_line_length,
+        footprint_radius,
     )
 
 
@@ -301,6 +381,26 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "dynamic_stop_distance",
             DEFAULT_DYNAMIC_STOP_DISTANCE_M,
         )
+        self.declare_parameter(
+            "nominal_min_corridor_width_m",
+            DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M,
+        )
+        self.declare_parameter(
+            "footprint_radius_m",
+            DEFAULT_FOOTPRINT_RADIUS_M,
+        )
+        self.declare_parameter(
+            "longitudinal_extra_margin_m",
+            DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M,
+        )
+        self.declare_parameter(
+            "laser_x_in_base_m",
+            DEFAULT_LASER_X_IN_BASE_M,
+        )
+        self.declare_parameter(
+            "laser_y_in_base_m",
+            DEFAULT_LASER_Y_IN_BASE_M,
+        )
         self.declare_parameter("minimum_completion_decision_steps", 3)
         self.declare_parameter("minimum_completion_known_cells", 20)
         self.declare_parameter("stagnation_window_steps", 10)
@@ -325,6 +425,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         )
         self.dynamic_stop_distance = float(
             self.get_parameter("dynamic_stop_distance").value
+        )
+        self.nominal_min_corridor_width_m = float(
+            self.get_parameter("nominal_min_corridor_width_m").value
+        )
+        self.footprint_radius_m = float(
+            self.get_parameter("footprint_radius_m").value
+        )
+        self.longitudinal_extra_margin_m = float(
+            self.get_parameter("longitudinal_extra_margin_m").value
+        )
+        self.laser_x_in_base_m = float(
+            self.get_parameter("laser_x_in_base_m").value
+        )
+        self.laser_y_in_base_m = float(
+            self.get_parameter("laser_y_in_base_m").value
+        )
+        self.dynamic_forward_center_line_extension_m = (
+            self.dynamic_stop_distance - self.footprint_radius_m
         )
         self.minimum_completion_decision_steps = int(
             self.get_parameter("minimum_completion_decision_steps").value
@@ -413,6 +531,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             },
             "motion_clearance_margin": self.motion_clearance_margin,
             "dynamic_stop_distance": self.dynamic_stop_distance,
+            "nominal_min_corridor_width_m": (
+                self.nominal_min_corridor_width_m
+            ),
+            "footprint_radius_m": self.footprint_radius_m,
+            "longitudinal_extra_margin_m": (
+                self.longitudinal_extra_margin_m
+            ),
+            "dynamic_forward_center_line_extension_m": (
+                self.dynamic_forward_center_line_extension_m
+            ),
+            "laser_x_in_base_m": self.laser_x_in_base_m,
+            "laser_y_in_base_m": self.laser_y_in_base_m,
             "drive_sensor_cycle_timeout_sec": (
                 self.drive_sensor_cycle_timeout_sec
             ),
@@ -430,9 +560,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"step_distance={self.step_distance:.3f} "
             "cardinal_distance=0.350 "
             f"diagonal_distance={math.sqrt(2.0) * self.cell_size:.3f} "
-            f"motion_clearance_margin={self.motion_clearance_margin:.3f} "
-            "margin_status=unvalidated_engineering_safety_margin "
+            "nominal_min_corridor_width_m="
+            f"{self.nominal_min_corridor_width_m:.3f} "
+            f"footprint_radius_m={self.footprint_radius_m:.3f} "
+            "footprint_status=deployment_safety_envelope_not_body_radius "
+            "longitudinal_extra_margin_m="
+            f"{self.longitudinal_extra_margin_m:.3f} "
+            "motion_clearance_margin_legacy="
+            f"{self.motion_clearance_margin:.3f} "
             f"dynamic_stop_distance={self.dynamic_stop_distance:.3f} "
+            "dynamic_forward_center_line_extension_m="
+            f"{self.dynamic_forward_center_line_extension_m:.3f} "
+            f"laser_x_in_base_m={self.laser_x_in_base_m:.5f} "
+            f"laser_y_in_base_m={self.laser_y_in_base_m:.5f} "
+            f"laser_yaw_in_base={self.laser_yaw_in_base:.5f} "
             "drive_sensor_cycle_timeout_sec="
             f"{self.drive_sensor_cycle_timeout_sec:.3f} "
             "drive_sensor_watchdog_status=engineering_watchdog "
@@ -604,6 +745,36 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError("motion_clearance_margin must be >= 0")
         if self.dynamic_stop_distance <= 0.0:
             raise ValueError("dynamic_stop_distance must be > 0")
+        if self.nominal_min_corridor_width_m <= 0.0:
+            raise ValueError("nominal_min_corridor_width_m must be > 0")
+        if self.footprint_radius_m <= 0.0:
+            raise ValueError("footprint_radius_m must be > 0")
+        if not math.isclose(
+            self.nominal_min_corridor_width_m,
+            2.0 * self.footprint_radius_m,
+            rel_tol=0.0,
+            abs_tol=FOOTPRINT_COMPARISON_TOLERANCE_M,
+        ):
+            raise ValueError(
+                "nominal_min_corridor_width_m must equal "
+                "2 * footprint_radius_m"
+            )
+        if self.longitudinal_extra_margin_m < 0.0:
+            raise ValueError("longitudinal_extra_margin_m must be >= 0")
+        if not math.isclose(
+            self.motion_clearance_margin,
+            self.footprint_radius_m + self.longitudinal_extra_margin_m,
+            rel_tol=0.0,
+            abs_tol=FOOTPRINT_COMPARISON_TOLERANCE_M,
+        ):
+            raise ValueError(
+                "legacy motion_clearance_margin must equal footprint_radius_m "
+                "+ longitudinal_extra_margin_m"
+            )
+        if self.dynamic_forward_center_line_extension_m < 0.0:
+            raise ValueError(
+                "dynamic_stop_distance must be >= footprint_radius_m"
+            )
         if self.minimum_completion_decision_steps < 1:
             raise ValueError("minimum_completion_decision_steps must be >= 1")
         if self.minimum_completion_known_cells < 1:
@@ -659,6 +830,28 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             step_distance=self.cell_size,
         )
 
+    def pre_motion_footprint_check(
+        self,
+        target: ActionExecutionTarget,
+        pose: dict[str, float],
+        scan: LaserScan,
+    ) -> FootprintCheck:
+        """Check an action's refreshed scan against its swept capsule."""
+        target_distance = math.hypot(
+            target.target_x - pose["x"],
+            target.target_y - pose["y"],
+        )
+        motion_yaw_in_base = norm_angle(target.target_yaw - pose["yaw"])
+        return scan_capsule_footprint_check(
+            scan,
+            motion_yaw_in_base,
+            target_distance + self.longitudinal_extra_margin_m,
+            self.footprint_radius_m,
+            self.laser_x_in_base_m,
+            self.laser_y_in_base_m,
+            self.laser_yaw_in_base,
+        )
+
     def prepare_continuous_pre_motion_plan(
         self,
         raw_policy_action: int,
@@ -680,10 +873,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 action for action, _value in q_ranked
                 if action != primary_action
             )
-        raw_observed: Optional[float] = None
+        raw_check: Optional[FootprintCheck] = None
         raw_target: Optional[ActionExecutionTarget] = None
         raw_distance: Optional[float] = None
-        raw_required: Optional[float] = None
+        raw_front_edge: Optional[float] = None
 
         for action_idx in ranked_actions:
             if action_idx not in self.allowed_actions:
@@ -693,26 +886,39 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 target.target_x - pose["x"],
                 target.target_y - pose["y"],
             )
-            required = required_motion_clearance(
-                distance,
-                self.min_sector_dist,
-                self.motion_clearance_margin,
+            front_edge = (
+                distance
+                + self.longitudinal_extra_margin_m
+                + self.footprint_radius_m
             )
-            observed = self.action_sector_min(action_idx, scan, odom)
+            footprint_check = self.pre_motion_footprint_check(
+                target,
+                pose,
+                scan,
+            )
             if action_idx == primary_action:
-                raw_observed = observed
+                raw_check = footprint_check
                 raw_target = target
                 raw_distance = distance
-                raw_required = required
-            if clearance_gate_passed(observed, required):
+                raw_front_edge = front_edge
+            if footprint_check.passed:
                 return ContinuousPreMotionPlan(
                     raw_policy_action=raw_policy_action,
                     executed_action=action_idx,
                     target=target,
                     pre_motion_pose=pose,
                     target_distance=distance,
-                    observed_clearance=observed,
-                    required_clearance=required,
+                    capsule_front_edge=front_edge,
+                    nearest_capsule_clearance=(
+                        footprint_check.nearest_capsule_clearance
+                    ),
+                    pre_motion_footprint_passed=True,
+                    obstruction_type=(
+                        raw_check.obstruction_type
+                        if action_idx != primary_action
+                        and raw_check is not None
+                        else None
+                    ),
                     gate_passed=True,
                     safety_fallback_used=action_idx != primary_action,
                 )
@@ -723,8 +929,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             target=raw_target,
             pre_motion_pose=pose,
             target_distance=raw_distance,
-            observed_clearance=raw_observed,
-            required_clearance=raw_required,
+            capsule_front_edge=raw_front_edge,
+            nearest_capsule_clearance=(
+                raw_check.nearest_capsule_clearance
+                if raw_check is not None
+                else None
+            ),
+            pre_motion_footprint_passed=False,
+            obstruction_type=(
+                raw_check.obstruction_type
+                if raw_check is not None
+                else "action_not_allowed"
+            ),
             gate_passed=False,
             safety_fallback_used=False,
         )
@@ -741,8 +957,58 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise RuntimeError("max_runtime_reached")
         super().publish_velocity(vx, wz)
 
+    def rotation_footprint_check(self, scan: LaserScan) -> FootprintCheck:
+        """Check the full circular deployment envelope before rotation."""
+        return scan_capsule_footprint_check(
+            scan,
+            0.0,
+            0.0,
+            self.footprint_radius_m,
+            self.laser_x_in_base_m,
+            self.laser_y_in_base_m,
+            self.laser_yaw_in_base,
+        )
+
+    def check_rotation_footprint_safety(self) -> None:
+        """Fail-stop if any fresh scan hit enters the rotation footprint."""
+        with self._sensor_condition:
+            scan = self.latest_scan
+            scan_received_at = self.latest_scan_received_at
+        self.require_fresh_sensor(
+            "/scan",
+            scan,
+            scan_received_at,
+            self.scan_timeout_sec,
+        )
+        result = (
+            self.rotation_footprint_check(scan)
+            if scan is not None
+            else FootprintCheck(False, None, "invalid_scan", 0)
+        )
+        if self._dynamic_step_record is not None:
+            self._dynamic_step_record["rotation_footprint_passed"] = (
+                result.passed
+            )
+            self._dynamic_step_record[
+                "rotation_nearest_footprint_clearance"
+            ] = result.nearest_capsule_clearance
+        if result.passed:
+            return
+        self.stop(repeat=3)
+        raise RotationFootprintBlocked(
+            "rotation_footprint_blocked: "
+            "nearest_footprint_clearance="
+            f"{format_optional_float(result.nearest_capsule_clearance)}m "
+            f"obstruction_type={result.obstruction_type}"
+        )
+
+    def execute_target(self, target: ActionExecutionTarget) -> float:
+        """Require a fresh all-around footprint pass before rotate phase."""
+        self.check_rotation_footprint_safety()
+        return super().execute_target(target)
+
     def check_drive_dynamic_safety(self) -> None:
-        """Stop before the next drive command when a fresh scan is unsafe."""
+        """Stop before drive when a fresh scan enters the short capsule."""
         with self._sensor_condition:
             if self.scan_sequence == self._last_dynamic_scan_sequence:
                 return
@@ -755,26 +1021,32 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             scan_received_at,
             self.scan_timeout_sec,
         )
-        observed = None
+        result = FootprintCheck(False, None, "invalid_scan", 0)
         if scan is not None:
-            observed = self.sector_min_dist(
+            result = scan_capsule_footprint_check(
                 scan,
                 0.0,
-                math.radians(22.5),
+                self.dynamic_forward_center_line_extension_m,
+                self.footprint_radius_m,
+                self.laser_x_in_base_m,
+                self.laser_y_in_base_m,
+                self.laser_yaw_in_base,
             )
         if self._dynamic_step_record is not None:
-            self._dynamic_step_record["dynamic_observed_clearance"] = observed
-        if dynamic_obstacle_should_stop(
-            observed,
-            self.dynamic_stop_distance,
-        ):
+            self._dynamic_step_record["dynamic_nearest_capsule_clearance"] = (
+                result.nearest_capsule_clearance
+            )
+        if not result.passed:
             if self._dynamic_step_record is not None:
                 self._dynamic_step_record["dynamic_obstacle_stop"] = True
+                self._dynamic_step_record["dynamic_footprint_stop"] = True
             self.stop(repeat=3)
             raise DynamicObstacleStop(
-                "dynamic_obstacle_stop: "
-                f"observed_clearance={format_optional_float(observed)}m "
-                f"< threshold={self.dynamic_stop_distance:.3f}m"
+                "dynamic_footprint_stop: "
+                "nearest_capsule_clearance="
+                f"{format_optional_float(result.nearest_capsule_clearance)}m "
+                f"obstruction_type={result.obstruction_type} "
+                f"front_edge={self.dynamic_stop_distance:.3f}m"
             )
 
     @staticmethod
@@ -899,15 +1171,27 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "q_ranked": None,
                 "executed_action": None,
                 "target_distance": None,
-                "observed_clearance": None,
-                "required_clearance": None,
+                "capsule_front_edge": None,
                 "motion_clearance_margin": self.motion_clearance_margin,
+                "nominal_min_corridor_width_m": (
+                    self.nominal_min_corridor_width_m
+                ),
+                "footprint_radius_m": self.footprint_radius_m,
+                "longitudinal_extra_margin_m": (
+                    self.longitudinal_extra_margin_m
+                ),
+                "nearest_capsule_clearance": None,
+                "pre_motion_footprint_passed": False,
+                "requested_action_obstruction_type": None,
+                "rotation_footprint_passed": None,
+                "rotation_nearest_footprint_clearance": None,
                 "gate_passed": False,
                 "expected_grid_state": None,
                 "actual_grid_state": None,
                 "grid_transition_match": None,
                 "dynamic_obstacle_stop": False,
-                "dynamic_observed_clearance": None,
+                "dynamic_footprint_stop": False,
+                "dynamic_nearest_capsule_clearance": None,
                 "drive_sensor_cycle_timeout_sec": (
                     self.drive_sensor_cycle_timeout_sec
                 ),
@@ -1065,13 +1349,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"executed_action={record['executed_action']} "
             f"safety_fallback_used={record['safety_fallback_used']} "
             f"target_distance={format_optional_float(record['target_distance'])} "
-            "required_clearance="
-            f"{format_optional_float(record['required_clearance'])} "
-            "observed_clearance="
-            f"{format_optional_float(record['observed_clearance'])} "
+            "capsule_front_edge="
+            f"{format_optional_float(record['capsule_front_edge'])} "
+            "nearest_capsule_clearance="
+            f"{format_optional_float(record['nearest_capsule_clearance'])} "
+            "pre_motion_footprint_passed="
+            f"{record['pre_motion_footprint_passed']} "
+            "requested_action_obstruction_type="
+            f"{record['requested_action_obstruction_type']} "
+            "rotation_footprint_passed="
+            f"{record['rotation_footprint_passed']} "
+            "rotation_nearest_footprint_clearance="
+            f"{format_optional_float(record['rotation_nearest_footprint_clearance'])} "
             f"gate_passed={record['gate_passed']} "
             f"grid_transition_match={record['grid_transition_match']} "
             f"dynamic_obstacle_stop={record['dynamic_obstacle_stop']} "
+            f"dynamic_footprint_stop={record['dynamic_footprint_stop']} "
+            "dynamic_nearest_capsule_clearance="
+            f"{format_optional_float(record['dynamic_nearest_capsule_clearance'])} "
             "drive_sensor_cycle_count="
             f"{record['drive_sensor_cycle_count']} "
             "drive_sensor_cycle_max_wait_sec="
@@ -1264,8 +1559,16 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "pre_motion_executed_action": plan.executed_action,
                         "safety_fallback_used": plan.safety_fallback_used,
                         "target_distance": plan.target_distance,
-                        "observed_clearance": plan.observed_clearance,
-                        "required_clearance": plan.required_clearance,
+                        "capsule_front_edge": plan.capsule_front_edge,
+                        "nearest_capsule_clearance": (
+                            plan.nearest_capsule_clearance
+                        ),
+                        "pre_motion_footprint_passed": (
+                            plan.pre_motion_footprint_passed
+                        ),
+                        "requested_action_obstruction_type": (
+                            plan.obstruction_type
+                        ),
                         "gate_passed": plan.gate_passed,
                     }
                 )
@@ -1366,6 +1669,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self._log_continuous_step(record)
                 self.get_logger().error(str(exc))
                 return "dynamic_obstacle_stop"
+            except RotationFootprintBlocked as exc:
+                self.stop()
+                record.update(self.sensor_age_diagnostics())
+                self.finish_step_record(
+                    record,
+                    step_started,
+                    False,
+                    "rotation_footprint_blocked",
+                )
+                self._log_continuous_step(record)
+                self.get_logger().error(str(exc))
+                return "rotation_footprint_blocked"
             except DriveSensorCycleTimeout as exc:
                 self.stop()
                 record.update(self.sensor_age_diagnostics())

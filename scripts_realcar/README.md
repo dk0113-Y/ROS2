@@ -225,19 +225,38 @@ true-map coverage。累计 belief 本身可动态扩展，Round 8 的 odom 派�
 实际 policy state 始终由相对 episode 起点的累计 odom 位移量化，二者不一致时记录
 `grid_transition_match=false`，不会强制移动抽象状态。
 
-运动前所需净空为：
+continuous runner 的部署安全层使用显式圆形 safety footprint：
 
 ```text
-required_clearance = max(min_sector_dist,
-                         target_distance + motion_clearance_margin)
+nominal_min_corridor_width_m = 0.40m
+footprint_radius_m = nominal_min_corridor_width_m / 2 = 0.20m
+longitudinal_extra_margin_m = 0.05m
+pre_motion_center_line_length = target_distance + 0.05m
+swept_volume = center-line segment (+) radius-0.20m circle
 ```
 
-默认 `motion_clearance_margin=0.25m` 复用已有最小 sector 安全下限作为保守余量。
-它是 **unvalidated engineering safety margin**，尚未经过真车标定。默认值下 cardinal
-所需净空为 `0.60m`，diagonal 约为 `0.745m`。直行阶段每收到一帧新 scan，都会重新
-检查当前车体前向扇区；低于 `dynamic_stop_distance=0.25m` 或没有有效距离时立即发布
-零速度并以 `dynamic_obstacle_stop` 中止当前 episode。该检查不应用于原地旋转阶段；
-旋转时的机器人 footprint 碰撞风险仍需后续几何标定。
+该 `0.20m` 是部署安全包络，不是真实机器人半径；实车约 `0.20m x 0.30m`，半对角线
+约 `0.1803m`。有效 LaserScan hit 会先按 `laser` 相对 `base_footprint` 的平移和 yaw
+转换到 base frame，再投影到候选动作坐标系。点到中心线段的最短距离小于 `0.20m`
+才会阻止动作；恰好位于 `0.20m` 名义边界的点允许通过（仅使用 `1e-9m` 数值容差）。
+因此 `0.40m` 直通道的平行侧墙不会再仅因进入动作方向 `+/-22.5deg` 扇区而误拒，
+同时 capsule 前缘仍为 cardinal `0.35+0.05+0.20=0.60m`、diagonal
+`sqrt(2)*0.35+0.05+0.20≈0.745m`。
+
+当前 Wheeltec 默认配置为 `mini_4wd`。bringup 的 `robot_model.yaml` 发布
+`base_footprint -> base_link` 平面平移和 yaw 均为 0，发布
+`base_footprint -> laser` 为 `x=0.03163m, y=0.00009m, yaw=0`；continuous runner
+以这组仓库现场配置核查值作为可覆盖参数默认值。URDF 中 `laser_link` 的 yaw 为 pi，
+但 `/scan` 使用 bringup 单独发布的 `laser` frame，二者不可混用。
+
+兼容参数 `motion_clearance_margin=0.25m` 不再作为独立 sector 判据；启动时要求它等于
+`footprint_radius_m + longitudinal_extra_margin_m`，防止两套安全语义冲突。直行阶段每
+收到一组新 scan/odom 后，用中心线长度
+`dynamic_stop_distance - footprint_radius_m = 0.05m` 的短 capsule 检查，保持前缘
+`0.25m`。侧向进入 `0.20m` 或正前方进入
+`0.25m` 都会先发布零速度并以 `dynamic_obstacle_stop` 中止；合法 `0.40m` 通道边界
+不会仅因侧墙存在而停止。进入 rotate phase 前还会用长度为 0 的全周圆形 footprint
+再检查一次，footprint 内有有效障碍点时 fail-stop，禁止开始旋转。
 
 正常完成只有满足最小决策步数、最小 known-area 后的 `frontier_exhausted`。此外还会
 检测 belief stagnation、重复 state 且信息不增长的 deadlock，并以 `max_steps`、
