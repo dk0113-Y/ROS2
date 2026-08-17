@@ -187,6 +187,27 @@ def motion_is_permitted(
     return execute and gate_passed and executed_action is not None
 
 
+def validate_commissioning_config(
+    commissioning_mode: bool,
+    max_steps: int,
+    commissioning_action_idx: int,
+) -> None:
+    """Reject unsafe or ambiguous commissioning configurations."""
+    if not commissioning_mode:
+        return
+    if max_steps != 1:
+        raise ValueError("commissioning_mode requires max_steps == 1")
+    if commissioning_action_idx not in range(8):
+        raise ValueError("commissioning_action_idx must be in [0, 7]")
+
+
+def action_source_for_mode(commissioning_mode: bool) -> str:
+    """Identify whether the motion candidate came from policy or operator."""
+    if commissioning_mode:
+        return "commissioning_override"
+    return "policy"
+
+
 def hard_limit_termination(
     completed_steps: int,
     max_steps: int,
@@ -243,6 +264,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.declare_parameter("deadlock_maximum_unique_states", 2)
         self.declare_parameter("deadlock_min_known_growth", 1)
         self.declare_parameter("no_safe_action_retries", 0)
+        self.declare_parameter("commissioning_mode", False)
+        self.declare_parameter("commissioning_action_idx", -1)
         self.declare_parameter(
             "disable_completion_termination_in_dryrun",
             True,
@@ -281,6 +304,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.no_safe_action_retries = int(
             self.get_parameter("no_safe_action_retries").value
         )
+        self.commissioning_mode = bool(
+            self.get_parameter("commissioning_mode").value
+        )
+        self.commissioning_action_idx = int(
+            self.get_parameter("commissioning_action_idx").value
+        )
         self.disable_completion_termination_in_dryrun = bool(
             self.get_parameter(
                 "disable_completion_termination_in_dryrun"
@@ -307,6 +336,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "diagonal_mode": self.diagonal_mode,
             "max_steps": self.max_steps,
             "max_runtime_sec": self.max_runtime_sec,
+            "commissioning_mode": self.commissioning_mode,
+            "commissioning_action_idx": self.commissioning_action_idx,
+            "action_source": action_source_for_mode(
+                self.commissioning_mode
+            ),
             "termination_parameters": {
                 "minimum_completion_decision_steps": (
                     self.minimum_completion_decision_steps
@@ -347,6 +381,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"motion_clearance_margin={self.motion_clearance_margin:.3f} "
             "margin_status=unvalidated_engineering_safety_margin "
             f"dynamic_stop_distance={self.dynamic_stop_distance:.3f} "
+            f"commissioning_mode={self.commissioning_mode} "
+            f"commissioning_action_idx={self.commissioning_action_idx} "
+            f"action_source={action_source_for_mode(self.commissioning_mode)} "
             "completion_source=belief_only"
         )
 
@@ -394,6 +431,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError("deadlock_min_known_growth must be >= 0")
         if self.no_safe_action_retries < 0:
             raise ValueError("no_safe_action_retries must be >= 0")
+        validate_commissioning_config(
+            self.commissioning_mode,
+            self.max_steps,
+            self.commissioning_action_idx,
+        )
 
     def agent_state_from_odom(
         self,
@@ -432,14 +474,21 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         q_ranked: list[tuple[int, float]],
         scan: LaserScan,
         odom: Odometry,
+        requested_action: Optional[int] = None,
+        allow_fallback: bool = True,
     ) -> ContinuousPreMotionPlan:
         """Re-gate ranked actions using refreshed sensors and path length."""
         pose = self.pose_record_from_odom(odom)
-        ranked_actions = [raw_policy_action]
-        ranked_actions.extend(
-            action for action, _value in q_ranked
-            if action != raw_policy_action
+        primary_action = (
+            raw_policy_action if requested_action is None
+            else requested_action
         )
+        ranked_actions = [primary_action]
+        if allow_fallback:
+            ranked_actions.extend(
+                action for action, _value in q_ranked
+                if action != primary_action
+            )
         raw_observed: Optional[float] = None
         raw_target: Optional[ActionExecutionTarget] = None
         raw_distance: Optional[float] = None
@@ -459,7 +508,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self.motion_clearance_margin,
             )
             observed = self.action_sector_min(action_idx, scan, odom)
-            if action_idx == raw_policy_action:
+            if action_idx == primary_action:
                 raw_observed = observed
                 raw_target = target
                 raw_distance = distance
@@ -474,7 +523,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     observed_clearance=observed,
                     required_clearance=required,
                     gate_passed=True,
-                    safety_fallback_used=action_idx != raw_policy_action,
+                    safety_fallback_used=action_idx != primary_action,
                 )
 
         return ContinuousPreMotionPlan(
@@ -560,6 +609,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "dynamic_obstacle_stop": False,
                 "dynamic_observed_clearance": None,
                 "step_success": False,
+                "commissioning_mode": self.commissioning_mode,
+                "commissioning_action_idx": self.commissioning_action_idx,
+                "action_source": action_source_for_mode(
+                    self.commissioning_mode
+                ),
             }
         )
         return record, started
@@ -627,6 +681,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
 
     def _completion_enabled(self) -> bool:
         """Return whether belief completion may terminate this episode."""
+        if self.commissioning_mode:
+            return False
         return self.execute or not self.disable_completion_termination_in_dryrun
 
     def _belief_termination(
@@ -689,6 +745,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"known_cells_delta={record['known_cells_delta']} "
             f"frontier_count={record['frontier_count']} "
             f"raw_policy_action={record['raw_policy_action']} "
+            f"action_source={record['action_source']} "
             f"executed_action={record['executed_action']} "
             f"safety_fallback_used={record['safety_fallback_used']} "
             f"target_distance={format_optional_float(record['target_distance'])} "
@@ -833,12 +890,17 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     reverse=True,
                 )
                 raw_action = int(torch.argmax(q_values, dim=1).item())
+                requested_action = (
+                    self.commissioning_action_idx
+                    if self.commissioning_mode
+                    else raw_action
+                )
                 record.update(
                     {
                         "q_values": q_list,
                         "q_ranked": q_ranked,
                         "raw_policy_action": raw_action,
-                        "pre_motion_requested_action": raw_action,
+                        "pre_motion_requested_action": requested_action,
                     }
                 )
 
@@ -857,6 +919,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     q_ranked,
                     refreshed_scan,
                     refreshed_odom,
+                    requested_action=requested_action,
+                    allow_fallback=not self.commissioning_mode,
                 )
                 record.update(
                     {
@@ -875,13 +939,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 if not plan.gate_passed or plan.target is None:
                     self.stop()
                     no_safe_action_count += 1
+                    blocked_reason = (
+                        "commissioning_action_blocked"
+                        if self.commissioning_mode
+                        else "no_safe_action"
+                    )
                     self.finish_step_record(
                         record,
                         step_started,
                         False,
-                        "no_safe_action",
+                        blocked_reason,
                     )
                     self._log_continuous_step(record)
+                    if self.commissioning_mode:
+                        return blocked_reason
                     if no_safe_action_count > self.no_safe_action_retries:
                         return "no_safe_action"
                     self.last_consumed_scan_sequence = self.scan_sequence

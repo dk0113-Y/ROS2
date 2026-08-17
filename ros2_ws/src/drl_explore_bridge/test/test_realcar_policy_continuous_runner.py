@@ -14,6 +14,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     ContinuousPreMotionPlan,
     DynamicObstacleStop,
     RealcarPolicyContinuousRunner,
+    action_source_for_mode,
     belief_statistics,
     clearance_gate_passed,
     dynamic_obstacle_should_stop,
@@ -25,6 +26,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     motion_is_permitted,
     repeated_state_deadlock,
     required_motion_clearance,
+    validate_commissioning_config,
 )
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
@@ -207,6 +209,131 @@ def test_old_fixed_threshold_is_not_enough_for_cardinal_motion():
 def test_sufficient_distance_aware_clearance_passes():
     required = required_motion_clearance(0.35, 0.25, 0.25)
     assert clearance_gate_passed(0.80, required)
+
+
+def test_normal_mode_keeps_policy_action_source_and_fallback_behavior():
+    validate_commissioning_config(False, 30, -1)
+    assert action_source_for_mode(False) == "policy"
+    harness = PlanHarness({1: 0.70, 2: 0.80})
+    plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
+        harness,
+        1,
+        [(1, 1.0), (2, 0.9)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert plan.executed_action == 2
+    assert plan.safety_fallback_used
+
+
+def test_commissioning_requires_exactly_one_step():
+    with pytest.raises(ValueError, match="max_steps == 1"):
+        validate_commissioning_config(True, 2, 2)
+
+
+def test_commissioning_reaches_policy_inference_before_step_cap():
+    harness = type(
+        "CommissioningCompletionHarness",
+        (),
+        {
+            "commissioning_mode": True,
+            "execute": True,
+            "disable_completion_termination_in_dryrun": False,
+        },
+    )()
+    assert not RealcarPolicyContinuousRunner._completion_enabled(harness)
+
+
+@pytest.mark.parametrize("action_idx", (-1, 8, 99))
+def test_commissioning_action_must_be_in_action_space(action_idx):
+    with pytest.raises(ValueError, match=r"\[0, 7\]"):
+        validate_commissioning_config(True, 1, action_idx)
+
+
+def test_safe_commissioning_action_is_the_executed_action():
+    harness = PlanHarness({1: 0.80, 2: 0.80, 4: 0.80})
+    plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
+        harness,
+        4,
+        [(4, 1.0), (1, 0.9), (2, 0.8)],
+        make_scan(1.0),
+        make_odom(),
+        requested_action=2,
+        allow_fallback=False,
+    )
+    assert action_source_for_mode(True) == "commissioning_override"
+    assert plan.raw_policy_action == 4
+    assert plan.executed_action == 2
+    assert not plan.safety_fallback_used
+
+
+def test_unsafe_commissioning_action_does_not_fallback():
+    harness = PlanHarness({1: 0.80, 2: 0.30, 4: 0.80})
+    plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
+        harness,
+        4,
+        [(4, 1.0), (1, 0.9), (2, 0.8)],
+        make_scan(1.0),
+        make_odom(),
+        requested_action=2,
+        allow_fallback=False,
+    )
+    assert plan.raw_policy_action == 4
+    assert plan.executed_action is None
+    assert not plan.gate_passed
+    assert not plan.safety_fallback_used
+
+
+def test_commissioning_cardinal_e_target_is_one_physical_cell():
+    harness = PlanHarness({2: 0.80})
+    plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
+        harness,
+        7,
+        [(7, 1.0), (2, 0.9)],
+        make_scan(1.0),
+        make_odom(),
+        requested_action=2,
+        allow_fallback=False,
+    )
+    assert plan.target is not None
+    assert plan.target.target_x == pytest.approx(0.35)
+    assert plan.target.target_y == pytest.approx(0.0)
+    assert plan.target_distance == pytest.approx(0.35)
+
+
+def test_commissioning_diagonal_ne_target_uses_grid_center_geometry():
+    harness = PlanHarness({1: 0.80})
+    plan = RealcarPolicyContinuousRunner.prepare_continuous_pre_motion_plan(
+        harness,
+        6,
+        [(6, 1.0), (1, 0.9)],
+        make_scan(1.0),
+        make_odom(),
+        requested_action=1,
+        allow_fallback=False,
+    )
+    assert plan.target is not None
+    assert plan.target.target_x == pytest.approx(0.35)
+    assert plan.target.target_y == pytest.approx(0.35)
+    assert plan.target_distance == pytest.approx(0.4949747468)
+
+
+def test_commissioning_action_does_not_override_odom_derived_state():
+    expected = expected_grid_state_from_action((60, 60), 2)
+    harness = type(
+        "CommissioningOdomHarness",
+        (),
+        {"odom_state_origin": (0.0, 0.0), "cell_size": 0.35},
+    )()
+    actual = RealcarPolicyContinuousRunner.agent_state_from_odom(
+        harness,
+        (60, 60),
+        0.10,
+        0.0,
+    )
+    assert expected == (60, 61)
+    assert actual == (60, 60)
+    assert not grid_transition_matches(expected, actual)
 
 
 def test_distance_aware_plan_falls_back_and_rebuilds_target():
