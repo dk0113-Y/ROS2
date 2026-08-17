@@ -93,3 +93,28 @@ export REALCAR_ROS_SETUP=/opt/ros/humble/setup.bash
 两个脚本都不启动运动节点。`realcar_policy_dryrun_node` 还会在启动时拒绝已有 `/cmd_vel` publisher 的环境。
 
 时间戳阈值可通过 `scan_timeout_sec`、`odom_timeout_sec` 和 `sensor_future_tolerance_sec` 参数调整；默认分别为 `0.5`、`0.5` 和 `0.1` 秒。只有确认实机消息频率和时钟同步后才应调整。
+
+## 真实机器人单步实验工具
+
+`run_realcar_step_once_experiment.sh` 固定了 Round 1 单步实验入口。脚本会加载 ROS、底盘工作空间（如已配置）和本仓库工作空间，确认 `drl_explore_bridge`、`/scan`、`/odom` 存在，然后启动 `realcar_step_once_safe_node`。
+
+默认是只观察模式，不发送非零速度：
+
+```bash
+export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
+./scripts_realcar/run_realcar_step_once_experiment.sh
+```
+
+只有在现场安全条件、人工监护和急停均已准备好后，才可显式加入 `--execute`：
+
+```bash
+./scripts_realcar/run_realcar_step_once_experiment.sh --execute \
+  -p action_idx:=2 \
+  -p step_distance:=0.18
+```
+
+脚本拒绝通过附加 ROS 参数设置 `execute`，避免绕过显式的 `--execute` 开关。其余节点参数可以在脚本参数末尾使用 `-p name:=value` 传入。
+
+节点在运动前打印 `step_experiment_start`，结束或失败后打印 `step_experiment_result`，包括动作、起止位姿、目标方向、目标距离、实际位移、耗时和失败原因。每次结果同时保存为 JSON。参数 `result_file_path` 默认是 `~/realcar_logs/`，目录会自动创建，默认文件名形如 `realcar_step_YYYYMMDD_HHMMSS.json`；也可传入一个明确的 `.json` 文件路径。已有明确文件不会被覆盖。
+
+`execute=false` 的观察记录会以 `success=false`、`failure_reason=execution_disabled` 保存，表示没有进行运动验证。`execute=true` 仅代表允许该节点执行一次既有的低速旋转和直行控制，并不构成连续自主探索或真实运动闭环验证。

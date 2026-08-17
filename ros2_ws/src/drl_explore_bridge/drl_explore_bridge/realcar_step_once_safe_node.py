@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
-from typing import Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -76,6 +80,7 @@ class RealcarStepOnceSafeNode(Node):
         self.declare_parameter("scan_timeout_sec", 0.5)
         self.declare_parameter("odom_timeout_sec", 0.5)
         self.declare_parameter("sensor_future_tolerance_sec", 0.1)
+        self.declare_parameter("result_file_path", "~/realcar_logs/")
 
         self.execute = bool(self.get_parameter("execute").value)
         self.action_idx = int(self.get_parameter("action_idx").value)
@@ -96,6 +101,7 @@ class RealcarStepOnceSafeNode(Node):
         self.sensor_future_tolerance_sec = float(
             self.get_parameter("sensor_future_tolerance_sec").value
         )
+        self.result_file_path = str(self.get_parameter("result_file_path").value)
 
         if not (0 <= self.action_idx < len(ACTIONS_8)):
             raise ValueError(f"action_idx out of range: {self.action_idx}")
@@ -113,10 +119,17 @@ class RealcarStepOnceSafeNode(Node):
         if self.sensor_future_tolerance_sec < 0.0:
             raise ValueError("sensor_future_tolerance_sec must be >= 0")
 
+        self.result_directory, self.explicit_result_file = self.prepare_result_location(
+            self.result_file_path
+        )
+
         self.latest_scan: Optional[LaserScan] = None
         self.latest_odom: Optional[Odometry] = None
         self.latest_scan_received_at: Optional[float] = None
         self.latest_odom_received_at: Optional[float] = None
+        self.experiment_result: Optional[dict[str, Any]] = None
+        self.experiment_started_monotonic: Optional[float] = None
+        self.result_write_attempted = False
         self.done = False
 
         # Keep odom subscription callbacks in a different callback group from the control timer.
@@ -147,9 +160,213 @@ class RealcarStepOnceSafeNode(Node):
             f"execute={self.execute}, "
             f"action_idx={self.action_idx}:{ACTION_NAMES[self.action_idx]}, "
             f"step_distance={self.step_distance:.3f}, linear_speed={self.linear_speed:.3f}, "
-            f"rotate_max_w={self.rotate_max_w:.3f}. "
+            f"rotate_max_w={self.rotate_max_w:.3f}, "
+            f"result_file_path={self.result_file_path}. "
             "This node can publish non-zero /cmd_vel only when execute=true (default false)."
         )
+        if self.execute:
+            self.get_logger().warn(
+                "WARNING:\n"
+                "REAL ROBOT MOTION ENABLED\n"
+                "Keep direct supervision and emergency stop ready."
+            )
+        else:
+            self.get_logger().warn(
+                "OBSERVATION ONLY: execute=false; no non-zero motion command will be sent."
+            )
+
+    @staticmethod
+    def prepare_result_location(result_file_path: str) -> tuple[Path, Optional[Path]]:
+        if not result_file_path.strip():
+            raise ValueError("result_file_path must not be empty")
+
+        expanded_path = Path(os.path.expandvars(result_file_path)).expanduser()
+        if expanded_path.suffix.lower() == ".json":
+            expanded_path.parent.mkdir(parents=True, exist_ok=True)
+            return expanded_path.parent, expanded_path
+
+        expanded_path.mkdir(parents=True, exist_ok=True)
+        return expanded_path, None
+
+    def pose_record(self) -> dict[str, float]:
+        x, y, yaw, odom_timestamp = self.pose_xy_yaw_time()
+        return {
+            "x": x,
+            "y": y,
+            "yaw_rad": yaw,
+            "yaw_deg": math.degrees(yaw),
+            "odom_timestamp": odom_timestamp,
+        }
+
+    def begin_experiment(
+        self,
+        start_pose: dict[str, float],
+        tx: float,
+        ty: float,
+        rel_forward: float,
+        rel_left: float,
+    ) -> None:
+        started_at = datetime.now().astimezone()
+        target_yaw = math.atan2(ty - start_pose["y"], tx - start_pose["x"])
+        target_distance = math.hypot(
+            tx - start_pose["x"],
+            ty - start_pose["y"],
+        )
+        self.experiment_started_monotonic = time.monotonic()
+        self.experiment_result = {
+            "timestamp": started_at.isoformat(timespec="milliseconds"),
+            "action_idx": self.action_idx,
+            "action_name": ACTION_NAMES[self.action_idx],
+            "execute": self.execute,
+            "start_pose": start_pose,
+            "end_pose": None,
+            "target_direction": {
+                "action_name": ACTION_NAMES[self.action_idx],
+                "relative_forward_m": rel_forward,
+                "relative_left_m": rel_left,
+                "world_yaw_rad": target_yaw,
+                "world_yaw_deg": math.degrees(target_yaw),
+            },
+            "target_position": {"x": tx, "y": ty},
+            "target_distance": target_distance,
+            "actual_distance": None,
+            "actual_displacement": None,
+            "duration": None,
+            "success": False,
+            "failure_reason": "in_progress",
+        }
+
+    def choose_result_path(self) -> Path:
+        if self.explicit_result_file is not None:
+            return self.explicit_result_file
+
+        if self.experiment_result is None:
+            raise RuntimeError("experiment result has not been initialized")
+
+        started_at = datetime.fromisoformat(str(self.experiment_result["timestamp"]))
+        filename_stem = f"realcar_step_{started_at.strftime('%Y%m%d_%H%M%S')}"
+        candidate = self.result_directory / f"{filename_stem}.json"
+        suffix = 1
+        while candidate.exists():
+            candidate = self.result_directory / f"{filename_stem}_{suffix:02d}.json"
+            suffix += 1
+        return candidate
+
+    def log_experiment_start(self) -> None:
+        if self.experiment_result is None:
+            return
+
+        result = self.experiment_result
+        start_pose = result["start_pose"]
+        target_direction = result["target_direction"]
+        self.get_logger().warn(
+            "step_experiment_start:\n"
+            f"  timestamp: {result['timestamp']}\n"
+            f"  action_idx: {result['action_idx']}\n"
+            f"  start_pose: x={start_pose['x']:.6f}, y={start_pose['y']:.6f}, "
+            f"yaw_rad={start_pose['yaw_rad']:.6f}\n"
+            f"  target_direction: {target_direction['action_name']}, "
+            f"world_yaw_rad={target_direction['world_yaw_rad']:.6f}\n"
+            f"  target_distance: {result['target_distance']:.6f}"
+        )
+
+    def save_experiment_result(self) -> Path:
+        if self.experiment_result is None:
+            raise RuntimeError("experiment result has not been initialized")
+
+        result_path = self.choose_result_path()
+        self.experiment_result["result_file"] = str(result_path)
+        with result_path.open("x", encoding="utf-8") as result_file:
+            json.dump(
+                self.experiment_result,
+                result_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            result_file.write("\n")
+        return result_path
+
+    def log_experiment_result(self, result_path: Optional[Path]) -> None:
+        if self.experiment_result is None:
+            return
+
+        result = self.experiment_result
+        start_pose = result["start_pose"]
+        end_pose = result["end_pose"]
+        target_direction = result["target_direction"]
+        end_pose_text = "null"
+        if end_pose is not None:
+            end_pose_text = (
+                f"x={end_pose['x']:.6f}, y={end_pose['y']:.6f}, "
+                f"yaw_rad={end_pose['yaw_rad']:.6f}"
+            )
+        actual_distance = result["actual_distance"]
+        actual_distance_text = (
+            "null" if actual_distance is None else f"{actual_distance:.6f}"
+        )
+        failure_reason = result["failure_reason"] or "none"
+        result_file_text = "not_saved" if result_path is None else str(result_path)
+        self.get_logger().warn(
+            "step_experiment_result:\n"
+            f"  timestamp: {result['timestamp']}\n"
+            f"  action_idx: {result['action_idx']}\n"
+            f"  start_pose: x={start_pose['x']:.6f}, y={start_pose['y']:.6f}, "
+            f"yaw_rad={start_pose['yaw_rad']:.6f}\n"
+            f"  end_pose: {end_pose_text}\n"
+            f"  target_direction: {target_direction['action_name']}, "
+            f"world_yaw_rad={target_direction['world_yaw_rad']:.6f}\n"
+            f"  target_distance: {result['target_distance']:.6f}\n"
+            f"  actual_displacement: {actual_distance_text}\n"
+            f"  duration: {result['duration']:.3f}\n"
+            f"  success: {str(result['success']).lower()}\n"
+            f"  failure_reason: {failure_reason}\n"
+            f"  result_file: {result_file_text}"
+        )
+
+    def finish_experiment(self, success: bool, failure_reason: Optional[str]) -> None:
+        if self.experiment_result is None or self.result_write_attempted:
+            return
+
+        self.result_write_attempted = True
+        end_pose: Optional[dict[str, float]] = None
+        if self.latest_odom is not None:
+            try:
+                end_pose = self.pose_record()
+            except Exception as exc:
+                self.get_logger().error(f"Unable to record final odom pose: {exc}")
+
+        start_pose = self.experiment_result["start_pose"]
+        actual_distance: Optional[float] = None
+        if end_pose is not None:
+            actual_distance = math.hypot(
+                end_pose["x"] - start_pose["x"],
+                end_pose["y"] - start_pose["y"],
+            )
+
+        duration = 0.0
+        if self.experiment_started_monotonic is not None:
+            duration = time.monotonic() - self.experiment_started_monotonic
+
+        self.experiment_result.update(
+            {
+                "end_timestamp": datetime.now()
+                .astimezone()
+                .isoformat(timespec="milliseconds"),
+                "end_pose": end_pose,
+                "actual_distance": actual_distance,
+                "actual_displacement": actual_distance,
+                "duration": duration,
+                "success": bool(success),
+                "failure_reason": failure_reason,
+            }
+        )
+
+        result_path: Optional[Path] = None
+        try:
+            result_path = self.save_experiment_result()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to save experiment JSON: {exc}")
+        self.log_experiment_result(result_path)
 
     def scan_cb(self, msg: LaserScan) -> None:
         self.latest_scan = msg
@@ -359,6 +576,15 @@ class RealcarStepOnceSafeNode(Node):
         try:
             x, y, yaw, _ = self.pose_xy_yaw_time()
             tx, ty, rel_forward, rel_left = self.target_for_action(x, y, yaw)
+            start_pose = self.pose_record()
+            self.begin_experiment(
+                start_pose,
+                tx,
+                ty,
+                rel_forward,
+                rel_left,
+            )
+            self.log_experiment_start()
 
             self.get_logger().warn(
                 "step_once_plan "
@@ -371,6 +597,7 @@ class RealcarStepOnceSafeNode(Node):
 
             if not self.execute:
                 self.get_logger().warn("DRY PLAN ONLY: execute=false, no movement command sent.")
+                self.finish_experiment(False, "execution_disabled")
                 self.done = True
                 return
 
@@ -378,10 +605,17 @@ class RealcarStepOnceSafeNode(Node):
                 raise RuntimeError("No /cmd_vel subscriber found")
 
             self.execute_target(tx, ty)
+            self.finish_experiment(True, None)
             self.done = True
 
+        except KeyboardInterrupt:
+            self.stop()
+            self.finish_experiment(False, "keyboard_interrupt")
+            self.done = True
+            raise
         except Exception as exc:
             self.stop()
+            self.finish_experiment(False, str(exc))
             self.done = True
             self.get_logger().error(f"FAIL: {exc}")
             self.get_logger().error("A stop command has been sent.")
@@ -398,6 +632,7 @@ def main(args=None) -> None:
     finally:
         try:
             node.stop()
+            node.finish_experiment(False, "node_shutdown_before_completion")
         finally:
             node.destroy_node()
             if rclpy.ok():
