@@ -258,13 +258,18 @@ def load_policy_model(checkpoint_path: str):
 
 
 class RealcarPolicySafeRunner(Node):
+    NODE_NAME = "realcar_policy_safe_runner_node"
+    DEFAULT_MAX_STEPS = 3
+    MAX_STEPS_LIMIT = MAX_SAFE_STEPS
+    DEFAULT_STEP_DISTANCE = 0.10
+
     def __init__(self) -> None:
-        super().__init__("realcar_policy_safe_runner_node")
+        super().__init__(self.NODE_NAME)
 
         self.declare_parameter("execute", False)
-        self.declare_parameter("max_steps", 3)
+        self.declare_parameter("max_steps", self.DEFAULT_MAX_STEPS)
         self.declare_parameter("checkpoint_path", DEFAULT_CHECKPOINT)
-        self.declare_parameter("step_distance", 0.10)
+        self.declare_parameter("step_distance", self.DEFAULT_STEP_DISTANCE)
         self.declare_parameter("motion_mode", "safe_rotate_drive")
         self.declare_parameter("linear_speed", 0.03)
         self.declare_parameter("rotate_kp", 1.2)
@@ -351,8 +356,10 @@ class RealcarPolicySafeRunner(Node):
             raise ValueError(
                 "checkpoint_path is required (or set DRL_CHECKPOINT_PATH)"
             )
-        if not (1 <= self.max_steps <= MAX_SAFE_STEPS):
-            raise ValueError(f"max_steps must be in [1, {MAX_SAFE_STEPS}]")
+        if not (1 <= self.max_steps <= self.MAX_STEPS_LIMIT):
+            raise ValueError(
+                f"max_steps must be in [1, {self.MAX_STEPS_LIMIT}]"
+            )
         max_step_distance = 0.35 if self.all8_action_mode else 0.25
         if self.step_distance <= 0.0 or self.step_distance > max_step_distance:
             raise ValueError(
@@ -465,10 +472,10 @@ class RealcarPolicySafeRunner(Node):
         )
 
         self.get_logger().warn(
-            "realcar_policy_safe_runner_node startup "
+            f"{self.NODE_NAME} startup "
             f"execute={self.execute} "
             f"max_steps={self.max_steps} "
-            f"max_safe_steps={MAX_SAFE_STEPS} "
+            f"max_safe_steps={self.MAX_STEPS_LIMIT} "
             f"checkpoint_path={self.checkpoint_path} "
             f"motion_mode={self.motion_mode} "
             f"full_action_mode={self.full_action_mode} "
@@ -1180,6 +1187,9 @@ class RealcarPolicySafeRunner(Node):
             return math.copysign(self.rotate_min_w, wz)
         return wz
 
+    def check_drive_dynamic_safety(self) -> None:
+        """Provide an opt-in drive-phase safety hook for derived runners."""
+
     def execute_target(self, target: ActionExecutionTarget) -> float:
         x0, y0, _yaw0, _ = self.pose_xy_yaw_time()
         target_dist = math.hypot(target.target_x - x0, target.target_y - y0)
@@ -1276,6 +1286,8 @@ class RealcarPolicySafeRunner(Node):
                     f"target_dist={target_dist:.3f}m "
                     f"effective_drive_timeout={effective_drive_timeout:.3f}s"
                 )
+
+            self.check_drive_dynamic_safety()
 
             target_yaw = math.atan2(target.target_y - y, target.target_x - x)
             yaw_err = norm_angle(target_yaw - yaw)

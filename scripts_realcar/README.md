@@ -13,7 +13,7 @@
 
 ```bash
 export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
-source scripts_realcar/realcar_env.sh
+source /home/wheeltec/git_repos/ROS2/scripts_realcar/realcar_env.sh
 setup_realcar_environment
 ros2 launch drl_explore_bridge bringup_realcar.launch.py
 ```
@@ -183,7 +183,7 @@ load、policy state build、policy inference、pre-motion refresh 耗时，以�
 只观察三次决策、绝不发送非零速度时：
 
 ```bash
-source scripts_realcar/realcar_env.sh
+source /home/wheeltec/git_repos/ROS2/scripts_realcar/realcar_env.sh
 setup_realcar_environment
 ros2 run drl_explore_bridge realcar_policy_safe_runner_node --ros-args \
   -p checkpoint_path:="$DRL_CHECKPOINT_PATH"
@@ -192,3 +192,78 @@ ros2 run drl_explore_bridge realcar_policy_safe_runner_node --ros-args \
 节点启动时会明确打印 `execute=false`。只有人工显式传入 `-p execute:=true` 才允许非零 `/cmd_vel`；实机执行还必须满足现场监护、急停、空旷区域及每一步开始前的传感器新鲜度检查。
 
 每次运行都会写入结构化 JSON，参数 `result_file_path` 默认是 `~/realcar_logs/`。顶层记录 `experiment_id`、请求/完成步数、总耗时、成功状态和失败原因；`steps` 中逐步记录 `step_id`、`action_idx`、`motion_mode`、起点/目标/终点位姿、实际位移、耗时、成功状态及失败原因。实验日志不得提交到本仓库。
+
+Round 7 的三步真实策略闭环已经在真车上完成一次验证：三步均成功，最终以
+`max_steps_reached` 结束。该节点继续作为冻结回归基线，默认
+`step_distance=0.10m`、`max_steps=3`、`execute=false`；Round 8 不改变这些默认值。
+
+## Round 8A 连续探索 runner
+
+`realcar_policy_continuous_runner_node` 是独立的、具有硬步数和运行时间上限的第一版
+连续探索 runner。它默认 `execute=false`，直接运行时不会发送非零 `/cmd_vel`。
+Round 8 使用一个物理尺度来源：`cell_size=0.35m`，并要求
+`step_distance==cell_size`；不一致时节点拒绝启动。训练动作是标准 8 邻域网格中心转移，
+所以 cardinal 动作的目标距离是 `0.35m`，diagonal 动作的 x/y 分量各为
+`0.35m`，欧氏目标距离是 `sqrt(2)*0.35≈0.495m`。这不是把 diagonal 归一化为
+固定路径长度。
+
+每个决策循环为：
+
+```text
+fresh observation -> cumulative belief -> policy inference
+  -> post-inference fresh scan/odom barrier
+  -> refreshed-scan distance-aware gate
+  -> final action + refreshed-odom grid-center target
+  -> optional motion with drive-phase dynamic obstacle stop
+  -> odom-derived actual state -> belief-side termination
+```
+
+真实世界完成判据只使用累计 belief：known cells、frontier 和其增长历史。传给
+`CumulativeBeliefMap` 的 120x120 全零数组只是构造兼容占位；runner 不读取它的
+true-map coverage。累计 belief 本身可动态扩展，Round 8 的 odom 派生 world-grid state
+不再受该占位数组的 120x120 边界限制。策略动作得到的 expected grid state 只写入诊断；
+实际 policy state 始终由相对 episode 起点的累计 odom 位移量化，二者不一致时记录
+`grid_transition_match=false`，不会强制移动抽象状态。
+
+运动前所需净空为：
+
+```text
+required_clearance = max(min_sector_dist,
+                         target_distance + motion_clearance_margin)
+```
+
+默认 `motion_clearance_margin=0.25m` 复用已有最小 sector 安全下限作为保守余量。
+它是 **unvalidated engineering safety margin**，尚未经过真车标定。默认值下 cardinal
+所需净空为 `0.60m`，diagonal 约为 `0.745m`。直行阶段每收到一帧新 scan，都会重新
+检查当前车体前向扇区；低于 `dynamic_stop_distance=0.25m` 或没有有效距离时立即发布
+零速度并以 `dynamic_obstacle_stop` 中止当前 episode。该检查不应用于原地旋转阶段；
+旋转时的机器人 footprint 碰撞风险仍需后续几何标定。
+
+正常完成只有满足最小决策步数、最小 known-area 后的 `frontier_exhausted`。此外还会
+检测 belief stagnation、重复 state 且信息不增长的 deadlock，并以 `max_steps`、
+`max_runtime_sec`、sensor/motion failure、有限 no-safe-action retry 和 operator interrupt
+作为有界 failsafe。所有窗口和阈值均可配置，不代表已经科学标定。
+
+只读软件检查示例（建议显式限制为 5 个 cycle）：
+
+```bash
+cd /home/wheeltec/git_repos/ROS2
+export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
+source /home/wheeltec/git_repos/ROS2/scripts_realcar/realcar_env.sh
+setup_realcar_environment
+export DRL_CHECKPOINT_PATH=/home/wheeltec/drl_repos/DRL-path-finding/deploy_checkpoints/A_full_method_last.pt
+ros2 run drl_explore_bridge realcar_policy_continuous_runner_node --ros-args \
+  -p checkpoint_path:="$DRL_CHECKPOINT_PATH" \
+  -p execute:=false \
+  -p max_steps:=5
+```
+
+`execute=false` 只验证 loop、belief、inference、sensor barrier、termination plumbing 和
+JSON logging；静止机器人不会提供真实运动后的状态变化，因此不能证明连续自主探索。
+Round 8 的 0.35m cardinal step、约 0.495m diagonal step、动态停车阈值和净空余量均
+尚未完成真车验证或标定。
+
+`scripts_realcar/realcar_env.sh` 是 Git 跟踪文件。如果当前 checkout 使用 sparse-checkout
+且未包含 `scripts_realcar`，相对路径 source 会显示 “No such file or directory”，即使
+commit 中存在该文件。应先在仓库根目录确认文件已 materialize，并优先使用上面的绝对
+路径；不要把 shell 中残留的 ROS 环境误当作脚本已成功执行。

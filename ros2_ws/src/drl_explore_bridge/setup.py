@@ -46,6 +46,10 @@ setup(
                 'realcar_policy_safe_runner_node = '
                 'drl_explore_bridge.realcar_policy_safe_runner_node:main'
             ),
+            (
+                'realcar_policy_continuous_runner_node = '
+                'drl_explore_bridge.realcar_policy_continuous_runner_node:main'
+            ),
         ],
     },
 )
