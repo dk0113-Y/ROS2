@@ -149,4 +149,35 @@ export REALCAR_BASE_WS_SETUP=/home/wheeltec/wheeltec_ros2_ws/install/setup.bash
   -p motion_mode:=safe_rotate_drive
 ```
 
-JSON 和终端结果增加 `motion_mode`、`target_pose`、`rotate_start_yaw`、`target_yaw`、`final_yaw`、`rotate_success` 和 `rotate_error`。`realcar_policy_safe_runner_node` 尚未完成连续探索适配；当 `max_steps > 1` 且 `step_distance` 与 DRL `cell_size=0.35m` 不一致时，节点会打印明确警告并拒绝启动，防止物理位移与 DRL 状态更新自动发生偏离。
+JSON 和终端结果增加 `motion_mode`、`target_pose`、`rotate_start_yaw`、`target_yaw`、`final_yaw`、`rotate_success` 和 `rotate_error`。
+
+## Round 3 安全三步执行框架
+
+`realcar_policy_safe_runner_node` 是最多三步的受限实验 runner，不是无限循环或完整自主探索节点。其默认参数为 `max_steps=3`、`execute=false`、`motion_mode=safe_rotate_drive` 和 `allowed_actions_mode=all8`。`max_steps` 只能设为 1～3；任何一步出现传感器超时、动作过滤、雷达门控、旋转/直行失败或其他异常，都会先发布零速度并取消剩余步骤。
+
+每一步按以下顺序处理：
+
+```text
+获取一组新的且时间戳有效的 /scan、/odom
+  -> 更新累计观测并执行一次 policy inference
+  -> realcar_action_adapter 生成固定 odom 目标
+  -> execute=true 时执行 safe_rotate_drive，等待动作完成并发布零速度
+  -> 再等待一组新的 /scan、/odom
+  -> 根据累计 odom 位移生成下一 DRL 网格状态
+  -> 进入下一步，最多三步
+```
+
+`step_distance` 与训练网格 `cell_size=0.35m` 不一致时会明确警告。runner 不再按所选动作盲目把抽象状态移动一格，而是用相对实验起点的累计 odom 位移量化到原有 DRL 行列坐标；小于半个网格的位移会保留在同一抽象单元。因此该机制只用于有限步迁移实验，仍存在连续坐标到离散网格的量化误差。
+
+只观察三次决策、绝不发送非零速度时：
+
+```bash
+source scripts_realcar/realcar_env.sh
+setup_realcar_environment
+ros2 run drl_explore_bridge realcar_policy_safe_runner_node --ros-args \
+  -p checkpoint_path:="$DRL_CHECKPOINT_PATH"
+```
+
+节点启动时会明确打印 `execute=false`。只有人工显式传入 `-p execute:=true` 才允许非零 `/cmd_vel`；实机执行还必须满足现场监护、急停、空旷区域及每一步开始前的传感器新鲜度检查。
+
+每次运行都会写入结构化 JSON，参数 `result_file_path` 默认是 `~/realcar_logs/`。顶层记录 `experiment_id`、请求/完成步数、总耗时、成功状态和失败原因；`steps` 中逐步记录 `step_id`、`action_idx`、`motion_mode`、起点/目标/终点位姿、实际位移、耗时、成功状态及失败原因。实验日志不得提交到本仓库。
