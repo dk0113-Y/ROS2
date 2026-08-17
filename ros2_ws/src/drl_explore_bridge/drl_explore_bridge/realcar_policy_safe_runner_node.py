@@ -241,6 +241,16 @@ def odom_delta_to_grid_offset(
     )
 
 
+def create_sensor_callback_groups(
+    separate: bool,
+) -> tuple[MutuallyExclusiveCallbackGroup, MutuallyExclusiveCallbackGroup]:
+    """Create shared legacy or independent scan/odom callback groups."""
+    scan_group = MutuallyExclusiveCallbackGroup()
+    if separate:
+        return scan_group, MutuallyExclusiveCallbackGroup()
+    return scan_group, scan_group
+
+
 def load_policy_model(checkpoint_path: str):
     drl_repo = checkpoint_repo_dir(checkpoint_path)
     if drl_repo not in sys.path:
@@ -262,6 +272,7 @@ class RealcarPolicySafeRunner(Node):
     DEFAULT_MAX_STEPS = 3
     MAX_STEPS_LIMIT = MAX_SAFE_STEPS
     DEFAULT_STEP_DISTANCE = 0.10
+    SEPARATE_SENSOR_CALLBACK_GROUPS = False
 
     def __init__(self) -> None:
         super().__init__(self.NODE_NAME)
@@ -452,7 +463,12 @@ class RealcarPolicySafeRunner(Node):
         self.scan_sequence = 0
         self.odom_sequence = 0
 
-        self.sensor_cb_group = MutuallyExclusiveCallbackGroup()
+        (
+            self.sensor_cb_group,
+            self.odom_sensor_cb_group,
+        ) = create_sensor_callback_groups(
+            self.SEPARATE_SENSOR_CALLBACK_GROUPS
+        )
         self.control_cb_group = MutuallyExclusiveCallbackGroup()
 
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -468,7 +484,7 @@ class RealcarPolicySafeRunner(Node):
             "/odom",
             self.odom_cb,
             LATEST_SENSOR_QOS,
-            callback_group=self.sensor_cb_group,
+            callback_group=self.odom_sensor_cb_group,
         )
 
         self.get_logger().warn(
@@ -1199,6 +1215,10 @@ class RealcarPolicySafeRunner(Node):
         del previous_scan_sequence, previous_odom_sequence
         rclpy.spin_once(self, timeout_sec=0.05)
 
+    def wait_for_control_callbacks(self, timeout_sec: float) -> None:
+        """Preserve Round 7 control-loop callback processing."""
+        rclpy.spin_once(self, timeout_sec=timeout_sec)
+
     def execute_target(self, target: ActionExecutionTarget) -> float:
         x0, y0, _yaw0, _ = self.pose_xy_yaw_time()
         target_dist = math.hypot(target.target_x - x0, target.target_y - y0)
@@ -1222,7 +1242,7 @@ class RealcarPolicySafeRunner(Node):
         last_progress_wall = rotate_wall_start
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.wait_for_control_callbacks(0.05)
             x, y, yaw, _ = self.pose_xy_yaw_time()
             err = norm_angle(target.target_yaw - yaw)
             wall_elapsed = time.monotonic() - rotate_wall_start

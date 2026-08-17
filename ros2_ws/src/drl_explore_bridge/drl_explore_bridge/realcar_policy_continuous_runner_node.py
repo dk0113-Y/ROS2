@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
@@ -26,9 +28,11 @@ from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
     INVISIBLE,
     RealcarPolicySafeRunner,
+    SensorRefreshBarrier,
     format_optional_float,
     load_policy_model,
     odom_delta_to_grid_offset,
+    sensor_sample_is_after_barrier,
 )
 
 
@@ -282,8 +286,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
     DEFAULT_MAX_STEPS = CONTINUOUS_DEFAULT_MAX_STEPS
     MAX_STEPS_LIMIT = CONTINUOUS_MAX_STEPS_LIMIT
     DEFAULT_STEP_DISTANCE = CONTINUOUS_CELL_SIZE_M
+    SEPARATE_SENSOR_CALLBACK_GROUPS = True
 
     def __init__(self) -> None:
+        self._sensor_condition = threading.Condition()
         super().__init__()
 
         self.declare_parameter("max_runtime_sec", 1800.0)
@@ -433,8 +439,142 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"commissioning_mode={self.commissioning_mode} "
             f"commissioning_action_idx={self.commissioning_action_idx} "
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
+            "sensor_executor=background_multithreaded "
+            "sensor_callback_groups=independent "
             "completion_source=belief_only"
         )
+
+    def scan_cb(self, msg: LaserScan) -> None:
+        """Update scan state and wake control waiters from the executor."""
+        with self._sensor_condition:
+            super().scan_cb(msg)
+            self._sensor_condition.notify_all()
+
+    def odom_cb(self, msg: Odometry) -> None:
+        """Update odom state and wake control waiters from the executor."""
+        with self._sensor_condition:
+            super().odom_cb(msg)
+            self._sensor_condition.notify_all()
+
+    def wait_for_control_callbacks(self, timeout_sec: float) -> None:
+        """Yield to continuously running background sensor callbacks."""
+        with self._sensor_condition:
+            self._sensor_condition.wait(timeout=max(0.0, timeout_sec))
+
+    def wait_for_inputs(
+        self,
+        after_scan_sequence: int = -1,
+        after_odom_sequence: int = -1,
+        after_monotonic: Optional[float] = None,
+    ) -> None:
+        """Wait on background callback notifications without spinning here."""
+        deadline = time.monotonic() + self.decision_timeout_sec
+        last_error = "no messages received"
+        with self._sensor_condition:
+            while rclpy.ok() and time.monotonic() < deadline:
+                if self.latest_scan is not None and self.latest_odom is not None:
+                    newer_scan = self.scan_sequence > after_scan_sequence
+                    newer_odom = self.odom_sequence > after_odom_sequence
+                    if after_monotonic is not None:
+                        newer_scan = sensor_sample_is_after_barrier(
+                            self.scan_sequence,
+                            self.latest_scan_received_at,
+                            after_scan_sequence,
+                            after_monotonic,
+                        )
+                        newer_odom = sensor_sample_is_after_barrier(
+                            self.odom_sequence,
+                            self.latest_odom_received_at,
+                            after_odom_sequence,
+                            after_monotonic,
+                        )
+                    if newer_scan and newer_odom:
+                        try:
+                            super().require_fresh_inputs()
+                        except RuntimeError as exc:
+                            last_error = str(exc)
+                        else:
+                            return
+                    else:
+                        last_error = (
+                            "waiting for background /scan and /odom callbacks: "
+                            f"scan={self.scan_sequence}>{after_scan_sequence} "
+                            f"odom={self.odom_sequence}>{after_odom_sequence}"
+                        )
+                remaining = deadline - time.monotonic()
+                self._sensor_condition.wait(
+                    timeout=min(0.1, max(0.0, remaining))
+                )
+        diagnostics = self.format_sensor_age_diagnostics(
+            self.sensor_age_diagnostics()
+        )
+        raise TimeoutError(
+            "timeout waiting for fresh /scan and /odom: "
+            f"{last_error}; {diagnostics}"
+        )
+
+    def sensor_age_diagnostics(self) -> dict[str, Optional[float] | int]:
+        """Read coherent sensor sequence and age fields under the sensor lock."""
+        with self._sensor_condition:
+            return super().sensor_age_diagnostics()
+
+    def require_fresh_inputs(self) -> None:
+        """Validate a coherent latest scan/odom snapshot under the lock."""
+        with self._sensor_condition:
+            super().require_fresh_inputs()
+
+    def pose_record(self) -> dict[str, float]:
+        """Read the latest odom pose under the sensor lock."""
+        with self._sensor_condition:
+            return super().pose_record()
+
+    def pose_xy_yaw_time(self) -> tuple[float, float, float, float]:
+        """Read the latest control pose under the sensor lock."""
+        with self._sensor_condition:
+            return super().pose_xy_yaw_time()
+
+    def capture_sensor_refresh_barrier(self):
+        """Capture both background callback sequences under the sensor lock."""
+        with self._sensor_condition:
+            return super().capture_sensor_refresh_barrier()
+
+    def refresh_inputs_after_barrier(
+        self,
+        barrier: SensorRefreshBarrier,
+    ) -> tuple[LaserScan, Odometry]:
+        """Return a coherent post-barrier pair updated by the executor."""
+        self.wait_for_inputs(
+            after_scan_sequence=barrier.scan_sequence,
+            after_odom_sequence=barrier.odom_sequence,
+            after_monotonic=barrier.started_monotonic,
+        )
+        with self._sensor_condition:
+            if self.latest_scan is None or self.latest_odom is None:
+                raise RuntimeError(
+                    "missing /scan or /odom after sensor refresh barrier"
+                )
+            return self.latest_scan, self.latest_odom
+
+    def consume_new_step_inputs(self) -> tuple[LaserScan, Odometry]:
+        """Consume a coherent pair produced by background callbacks."""
+        self.wait_for_inputs(
+            self.last_consumed_scan_sequence,
+            self.last_consumed_odom_sequence,
+        )
+        with self._sensor_condition:
+            if self.latest_scan is None or self.latest_odom is None:
+                raise RuntimeError("missing /scan or /odom after fresh input wait")
+            self.last_consumed_scan_sequence = self.scan_sequence
+            self.last_consumed_odom_sequence = self.odom_sequence
+            return self.latest_scan, self.latest_odom
+
+    def refresh_after_motion(self) -> None:
+        """Refresh and mark a coherent post-motion sensor pair consumed."""
+        barrier = self.capture_sensor_refresh_barrier()
+        self.refresh_inputs_after_barrier(barrier)
+        with self._sensor_condition:
+            self.last_consumed_scan_sequence = self.scan_sequence
+            self.last_consumed_odom_sequence = self.odom_sequence
 
     def _validate_continuous_parameters(self) -> None:
         """Validate Round 8 invariants and bounded termination settings."""
@@ -603,19 +743,22 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
 
     def check_drive_dynamic_safety(self) -> None:
         """Stop before the next drive command when a fresh scan is unsafe."""
-        if self.scan_sequence == self._last_dynamic_scan_sequence:
-            return
-        self._last_dynamic_scan_sequence = self.scan_sequence
+        with self._sensor_condition:
+            if self.scan_sequence == self._last_dynamic_scan_sequence:
+                return
+            self._last_dynamic_scan_sequence = self.scan_sequence
+            scan = self.latest_scan
+            scan_received_at = self.latest_scan_received_at
         self.require_fresh_sensor(
             "/scan",
-            self.latest_scan,
-            self.latest_scan_received_at,
+            scan,
+            scan_received_at,
             self.scan_timeout_sec,
         )
         observed = None
-        if self.latest_scan is not None:
+        if scan is not None:
             observed = self.sector_min_dist(
-                self.latest_scan,
+                scan,
                 0.0,
                 math.radians(22.5),
             )
@@ -677,14 +820,6 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 ages[source_key],
             )
 
-    def spin_drive_sensor_once(self, timeout_sec: float) -> None:
-        """Spin one bounded callback interval for the drive sensor barrier."""
-        rclpy.spin_once(self, timeout_sec=timeout_sec)
-
-    def drive_sensor_cycle_active(self) -> bool:
-        """Return whether the ROS context can continue the bounded wait."""
-        return rclpy.ok()
-
     def wait_for_drive_sensor_cycle(
         self,
         previous_scan_sequence: int,
@@ -695,28 +830,37 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         deadline = started + self.drive_sensor_cycle_timeout_sec
         scan_advanced = False
         odom_advanced = False
+        pair_advanced = False
 
-        while self.drive_sensor_cycle_active() and time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            self.spin_drive_sensor_once(min(0.05, max(0.0, remaining)))
-            scan_advanced, odom_advanced, pair_advanced = (
-                drive_sensor_sequence_progress(
-                    self.scan_sequence,
-                    self.odom_sequence,
-                    previous_scan_sequence,
-                    previous_odom_sequence,
+        with self._sensor_condition:
+            while self.sensor_callbacks_active() and time.monotonic() < deadline:
+                scan_advanced, odom_advanced, pair_advanced = (
+                    drive_sensor_sequence_progress(
+                        self.scan_sequence,
+                        self.odom_sequence,
+                        previous_scan_sequence,
+                        previous_odom_sequence,
+                    )
                 )
+                if pair_advanced:
+                    break
+                remaining = deadline - time.monotonic()
+                self._sensor_condition.wait(
+                    timeout=min(0.05, max(0.0, remaining))
+                )
+            else:
+                pair_advanced = False
+
+        if pair_advanced:
+            self._record_drive_sensor_cycle(
+                time.monotonic() - started,
+                scan_advanced,
+                odom_advanced,
+                False,
             )
-            if pair_advanced:
-                self._record_drive_sensor_cycle(
-                    time.monotonic() - started,
-                    scan_advanced,
-                    odom_advanced,
-                    False,
-                )
-                self.require_fresh_inputs()
-                self.check_drive_dynamic_safety()
-                return
+            self.require_fresh_inputs()
+            self.check_drive_dynamic_safety()
+            return
 
         wait_duration = time.monotonic() - started
         self._record_drive_sensor_cycle(
@@ -734,6 +878,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"odom_advanced={odom_advanced}; "
             f"{self.format_sensor_age_diagnostics(diagnostics)}"
         )
+
+    def sensor_callbacks_active(self) -> bool:
+        """Return whether the background executor context remains active."""
+        return rclpy.ok()
 
     def begin_step_record(self, step_id: int) -> tuple[dict[str, Any], float]:
         """Create a compact continuous-decision JSON record."""
@@ -1267,6 +1415,14 @@ def main(args=None) -> None:
     """Run the guarded continuous node and always issue a final stop."""
     rclpy.init(args=args)
     node = RealcarPolicyContinuousRunner()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    executor_thread = threading.Thread(
+        target=executor.spin,
+        name="continuous_sensor_executor",
+        daemon=True,
+    )
+    executor_thread.start()
     exit_reason = "unknown"
     try:
         exit_reason = node.run()
@@ -1284,6 +1440,8 @@ def main(args=None) -> None:
             node.finish_experiment(exit_reason)
             node.get_logger().warn(f"node_exit_reason={exit_reason}")
         finally:
+            executor.shutdown(timeout_sec=2.0)
+            executor_thread.join(timeout=2.0)
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
