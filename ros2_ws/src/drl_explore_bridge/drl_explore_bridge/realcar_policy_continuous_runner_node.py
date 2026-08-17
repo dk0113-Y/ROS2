@@ -210,20 +210,24 @@ def action_source_for_mode(commissioning_mode: bool) -> str:
 
 def successful_step_termination_reason(
     commissioning_mode: bool,
+    execute: bool,
 ) -> Optional[str]:
     """Return the dedicated completion reason for a successful commission."""
     if commissioning_mode:
-        return "commissioning_complete"
+        if execute:
+            return "commissioning_complete"
+        return "commissioning_dryrun_complete"
     return None
 
 
 def episode_success_for_reason(
     commissioning_mode: bool,
+    execute: bool,
     exit_reason: str,
 ) -> bool:
     """Classify normal exploration and commissioning success separately."""
     if commissioning_mode:
-        return exit_reason == "commissioning_complete"
+        return execute and exit_reason == "commissioning_complete"
     return exit_reason == "frontier_exhausted"
 
 
@@ -661,6 +665,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         steps = self.experiment_result["steps"]
         success = episode_success_for_reason(
             self.commissioning_mode,
+            self.execute,
             exit_reason,
         )
         duration = time.monotonic() - self.experiment_started_monotonic
@@ -1026,7 +1031,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self.finish_step_record(record, step_started, True, None)
                 self._log_continuous_step(record)
                 successful_termination = successful_step_termination_reason(
-                    self.commissioning_mode
+                    self.commissioning_mode,
+                    self.execute,
                 )
                 if successful_termination is not None:
                     return successful_termination

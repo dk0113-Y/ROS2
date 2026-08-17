@@ -247,25 +247,37 @@ def test_commissioning_reaches_policy_inference_before_step_cap():
 
 
 def test_successful_commissioning_has_successful_completion_semantics():
-    reason = successful_step_termination_reason(True)
+    reason = successful_step_termination_reason(True, True)
     assert reason == "commissioning_complete"
-    assert episode_success_for_reason(True, reason)
+    assert episode_success_for_reason(True, True, reason)
+
+
+def test_commissioning_dryrun_is_complete_but_not_motion_success():
+    reason = successful_step_termination_reason(True, False)
+    assert reason == "commissioning_dryrun_complete"
+    assert not episode_success_for_reason(True, False, reason)
+    assert not episode_success_for_reason(
+        True,
+        False,
+        "commissioning_complete",
+    )
 
 
 def test_blocked_commissioning_is_not_successful():
     assert not episode_success_for_reason(
+        True,
         True,
         "commissioning_action_blocked",
     )
 
 
 def test_normal_max_steps_is_not_successful():
-    assert successful_step_termination_reason(False) is None
-    assert not episode_success_for_reason(False, "max_steps_reached")
+    assert successful_step_termination_reason(False, True) is None
+    assert not episode_success_for_reason(False, True, "max_steps_reached")
 
 
 def test_frontier_exhaustion_remains_normal_continuous_success():
-    assert episode_success_for_reason(False, "frontier_exhausted")
+    assert episode_success_for_reason(False, True, "frontier_exhausted")
 
 
 @pytest.mark.parametrize("action_idx", (-1, 8, 99))
