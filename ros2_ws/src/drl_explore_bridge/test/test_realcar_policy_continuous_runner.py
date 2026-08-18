@@ -47,6 +47,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     episode_success_for_reason,
     export_belief_evidence,
     expected_grid_state_from_action,
+    final_trajectory_belief_diagnostics,
     frontier_exhausted,
     grid_transition_matches,
     hard_limit_termination,
@@ -55,6 +56,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     repeated_state_deadlock,
     scan_capsule_footprint_check,
     scan_points_in_base,
+    safety_fallback_diagnostics,
     successful_step_termination_reason,
     validate_commissioning_config,
 )
@@ -455,6 +457,7 @@ class FakeCumulativeBeliefMap:
     def __init__(self, true_grid, agent_state, snap):
         del true_grid, agent_state, snap
         self.map = np.zeros((3, 3), dtype=np.int8)
+        self.visit_count = np.zeros((3, 3), dtype=np.int32)
 
     def update(self, agent_state, snap):
         """Accept subsequent real-state observations."""
@@ -956,6 +959,36 @@ def test_belief_evidence_export_preserves_map_and_metadata(tmp_path):
     assert (tmp_path / "episode_belief.png").read_bytes().startswith(
         b"\x89PNG\r\n\x1a\n"
     )
+
+
+def test_final_trajectory_diagnostics_use_unique_cells():
+    class Belief:
+        origin_world_rc = (60, 60)
+        map = np.array([[0, 1], [0, 0]], dtype=np.int8)
+
+    diagnostics = final_trajectory_belief_diagnostics(
+        Belief(),
+        [(60, 60), (60, 61), (60, 60)],
+    )
+
+    assert diagnostics["final_trajectory_cell_count"] == 2
+    assert diagnostics["final_trajectory_obstacle_count"] == 1
+    assert diagnostics["final_trajectory_obstacle_ratio"] == pytest.approx(
+        0.5
+    )
+
+
+def test_safety_fallback_diagnostics_count_successful_motion_only():
+    diagnostics = safety_fallback_diagnostics(
+        [
+            {"step_success": True, "safety_fallback_used": True},
+            {"step_success": True, "safety_fallback_used": False},
+            {"step_success": False, "safety_fallback_used": True},
+        ]
+    )
+
+    assert diagnostics["safety_fallback_total_count"] == 1
+    assert diagnostics["safety_fallback_rate"] == pytest.approx(0.5)
 
 
 def test_continuous_footprint_defaults_define_040_corridor():

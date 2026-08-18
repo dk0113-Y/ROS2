@@ -31,6 +31,14 @@ class ObstaclePromotionStats:
     promoted_from_invisible: int
 
 
+@dataclass(frozen=True)
+class VisitedCellCorrectionStats:
+    """Count physical-traversal corrections to cumulative belief."""
+
+    corrected_from_obstacle: int
+    revealed_from_invisible: int
+
+
 def _nearest_cell_offset(distance: float, cell_size: float) -> int:
     """Quantize a continuous center-relative distance to one grid cell."""
     return int(math.floor(float(distance) / float(cell_size) + 0.5))
@@ -188,7 +196,8 @@ def promote_observed_obstacle_cells(
     cum_map: Any,
     obstacle_cells: Iterable[tuple[int, int]],
 ) -> ObstaclePromotionStats:
-    """Promote observed cells to obstacles using the core's cache hooks."""
+    """Promote only unvisited cells using the core's cache hooks."""
+    preserve_visited_cells_as_free(cum_map)
     unique_cells = sorted(
         {(int(row), int(col)) for row, col in obstacle_cells}
     )
@@ -210,7 +219,11 @@ def promote_observed_obstacle_cells(
     array_rows = world_rows - int(cum_map.origin_world_rc[0])
     array_cols = world_cols - int(cum_map.origin_world_rc[1])
     previous = np.asarray(cum_map.map[array_rows, array_cols]).copy()
-    promote = previous != OBSTACLE
+    unvisited = np.asarray(
+        cum_map.visit_count[array_rows, array_cols] <= 0,
+        dtype=bool,
+    )
+    promote = unvisited & (previous != OBSTACLE)
     promoted_count = int(np.count_nonzero(promote))
     promoted_from_empty = int(np.count_nonzero(previous[promote] == EMPTY))
     promoted_from_invisible = int(
@@ -242,4 +255,119 @@ def promote_observed_obstacle_cells(
         promoted_count,
         promoted_from_empty,
         promoted_from_invisible,
+    )
+
+
+def _apply_visited_free_corrections(
+    cum_map: Any,
+    array_rows: np.ndarray,
+    array_cols: np.ndarray,
+    world_rows: np.ndarray,
+    world_cols: np.ndarray,
+    dirty_rects: list[Any],
+) -> VisitedCellCorrectionStats:
+    """Set selected visited cells FREE and refresh all derived map state."""
+    previous = np.asarray(cum_map.map[array_rows, array_cols]).copy()
+    correct = previous != EMPTY
+    corrected_from_obstacle = int(
+        np.count_nonzero(previous[correct] == OBSTACLE)
+    )
+    revealed_from_invisible = int(
+        np.count_nonzero(previous[correct] == INVISIBLE)
+    )
+
+    if np.any(correct):
+        corrected_rows = array_rows[correct]
+        corrected_cols = array_cols[correct]
+        cum_map.map[corrected_rows, corrected_cols] = EMPTY
+        if revealed_from_invisible:
+            newly_known = previous[correct] == INVISIBLE
+            cum_map.kpm_count += cum_map._count_coverage_hits(
+                world_rows[correct][newly_known],
+                world_cols[correct][newly_known],
+            )
+        cum_map._invalidate_map_state_caches()
+        dirty = cum_map._dirty_rect_from_points(
+            corrected_rows,
+            corrected_cols,
+        )
+        dirty = cum_map._expand_dirty_rect(dirty, radius=1)
+        if dirty is not None:
+            dirty_rects.append(dirty)
+
+    cum_map._update_frontier_dirty_rects(dirty_rects)
+    cum_map._refresh_coverage()
+    cum_map._update_analysis_box()
+    return VisitedCellCorrectionStats(
+        corrected_from_obstacle,
+        revealed_from_invisible,
+    )
+
+
+def preserve_visited_cells_as_free(
+    cum_map: Any,
+) -> VisitedCellCorrectionStats:
+    """Enforce that every cell already in ``visit_count`` remains FREE."""
+    visited_rows, visited_cols = np.nonzero(cum_map.visit_count > 0)
+    if visited_rows.size == 0:
+        return VisitedCellCorrectionStats(0, 0)
+
+    needs_correction = cum_map.map[visited_rows, visited_cols] != EMPTY
+    if not np.any(needs_correction):
+        return VisitedCellCorrectionStats(0, 0)
+
+    array_rows = visited_rows[needs_correction].astype(np.int32, copy=False)
+    array_cols = visited_cols[needs_correction].astype(np.int32, copy=False)
+    world_rows = array_rows + int(cum_map.origin_world_rc[0])
+    world_cols = array_cols + int(cum_map.origin_world_rc[1])
+    return _apply_visited_free_corrections(
+        cum_map,
+        array_rows,
+        array_cols,
+        world_rows,
+        world_cols,
+        [],
+    )
+
+
+def record_traversed_cells_as_free(
+    cum_map: Any,
+    traversed_cells: Iterable[tuple[int, int]],
+) -> VisitedCellCorrectionStats:
+    """Register robot-center trajectory cells and make them authoritative FREE."""
+    unique_cells = sorted(
+        {(int(row), int(col)) for row, col in traversed_cells}
+    )
+    if not unique_cells:
+        return VisitedCellCorrectionStats(0, 0)
+
+    world_rows = np.asarray([cell[0] for cell in unique_cells], dtype=np.int32)
+    world_cols = np.asarray([cell[1] for cell in unique_cells], dtype=np.int32)
+    expansion = cum_map._ensure_world_bounds(
+        int(world_rows.min()),
+        int(world_rows.max()),
+        int(world_cols.min()),
+        int(world_cols.max()),
+    )
+    dirty_rects: list[Any] = []
+    if expansion is not None:
+        dirty_rects.extend(expansion.seam_dirty_rects)
+
+    array_rows = world_rows - int(cum_map.origin_world_rc[0])
+    array_cols = world_cols - int(cum_map.origin_world_rc[1])
+    newly_visited = cum_map.visit_count[array_rows, array_cols] <= 0
+    if np.any(newly_visited):
+        cum_map.visit_count[
+            array_rows[newly_visited],
+            array_cols[newly_visited],
+        ] = 1
+        cum_map._invalidate_visit_cache()
+
+    return _apply_visited_free_corrections(
+        cum_map,
+        array_rows,
+        array_cols,
+        world_rows,
+        world_cols,
+        dirty_rects,
     )

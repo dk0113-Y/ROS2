@@ -12,6 +12,7 @@ from drl_explore_bridge.realcar_conservative_belief import (
     OBSTACLE,
     project_scan_to_belief,
     promote_observed_obstacle_cells,
+    record_traversed_cells_as_free,
 )
 
 
@@ -94,6 +95,7 @@ class BeliefCacheHarness:
         self.origin_world_rc = (58, 58)
         self.map = np.full((5, 5), INVISIBLE, dtype=np.int8)
         self.map[2, 2] = EMPTY
+        self.visit_count = np.zeros((5, 5), dtype=np.int32)
         self.frontier_u8 = frontier_mask(self.map)
         self.frontier_revision = 1
         self._latest_frontier_stats = object()
@@ -101,6 +103,7 @@ class BeliefCacheHarness:
         self.kpm_count = 1
         self.coverage_refreshed = False
         self.analysis_refreshed = False
+        self.visit_cache_invalidated = False
 
     def _ensure_world_bounds(self, min_row, max_row, min_col, max_col):
         assert 58 <= min_row <= max_row <= 62
@@ -114,6 +117,9 @@ class BeliefCacheHarness:
     def _invalidate_map_state_caches(self):
         self._latest_frontier_stats = None
         self._cached_obstacle_integral = None
+
+    def _invalidate_visit_cache(self):
+        self.visit_cache_invalidated = True
 
     @staticmethod
     def _dirty_rect_from_points(rows, cols):
@@ -214,6 +220,57 @@ def test_empty_cell_is_promoted_to_obstacle():
     assert stats.promoted_from_invisible == 0
 
 
+def test_visited_empty_cell_rejects_later_obstacle_endpoint():
+    """Physical traversal is stronger than a later quantized endpoint."""
+    belief = BeliefCacheHarness()
+    belief.visit_count[2, 2] = 1
+
+    stats = promote_observed_obstacle_cells(belief, {ORIGIN_STATE})
+
+    assert belief.map[2, 2] == EMPTY
+    assert stats.obstacle_promotions_this_step == 0
+
+
+def test_unvisited_empty_cell_still_promotes_to_obstacle():
+    """Conservative endpoint promotion is unchanged outside the trajectory."""
+    belief = BeliefCacheHarness()
+
+    stats = promote_observed_obstacle_cells(belief, {ORIGIN_STATE})
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert stats.obstacle_promotions_this_step == 1
+
+
+def test_previously_obstacle_cell_is_restored_when_traversed():
+    """Later robot-center occupancy corrects an old obstacle belief."""
+    belief = BeliefCacheHarness()
+    belief.map[2, 2] = OBSTACLE
+
+    corrections = record_traversed_cells_as_free(
+        belief,
+        {ORIGIN_STATE},
+    )
+
+    assert belief.map[2, 2] == EMPTY
+    assert belief.visit_count[2, 2] == 1
+    assert corrections.corrected_from_obstacle == 1
+
+
+def test_current_agent_cell_remains_empty_despite_same_cell_endpoint():
+    """A coarse endpoint cannot turn the occupied agent cell into obstacle."""
+    belief = BeliefCacheHarness()
+    belief.visit_count[2, 2] = 1
+    observation = project(make_scan(0.08), laser_x=0.0)
+    assert observation.obstacle_cells == frozenset({ORIGIN_STATE})
+
+    promote_observed_obstacle_cells(
+        belief,
+        observation.obstacle_cells,
+    )
+
+    assert belief.map[2, 2] == EMPTY
+
+
 def test_invalid_ray_does_not_reset_a_known_obstacle():
     """An invalid beam cannot demote persistent cumulative evidence."""
     belief = BeliefCacheHarness()
@@ -261,5 +318,25 @@ def test_promotion_invalidates_caches_and_refreshes_frontier():
     assert belief.frontier_revision == 2
     assert belief._latest_frontier_stats is None
     assert belief._cached_obstacle_integral is None
+    assert belief.coverage_refreshed
+    assert belief.analysis_refreshed
+
+
+def test_obstacle_to_visited_free_refreshes_frontier_and_caches():
+    """Traversal correction keeps derived frontier and obstacle state coherent."""
+    belief = BeliefCacheHarness()
+    promote_observed_obstacle_cells(belief, {ORIGIN_STATE})
+    belief._cached_obstacle_integral = np.ones((2, 2), dtype=np.int64)
+    belief._latest_frontier_stats = object()
+    assert belief.get_frontier_u8()[2, 2] == 0
+
+    record_traversed_cells_as_free(belief, {ORIGIN_STATE})
+
+    assert belief.map[2, 2] == EMPTY
+    assert belief.get_frontier_u8()[2, 2] == 255
+    assert belief.frontier_revision == 3
+    assert belief._latest_frontier_stats is None
+    assert belief._cached_obstacle_integral is None
+    assert belief.visit_cache_invalidated
     assert belief.coverage_refreshed
     assert belief.analysis_refreshed

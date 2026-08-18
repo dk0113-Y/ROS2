@@ -25,9 +25,11 @@ from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
 from drl_explore_bridge.realcar_conservative_belief import (
+    OBSTACLE,
     ProjectedBeliefObservation,
     project_scan_to_belief,
     promote_observed_obstacle_cells,
+    record_traversed_cells_as_free,
 )
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
@@ -398,6 +400,65 @@ def episode_trajectory_states(
         append_state(step.get("agent_state"))
         append_state(step.get("actual_grid_state"))
     return trajectory
+
+
+def final_trajectory_belief_diagnostics(
+    cum_map: Any,
+    trajectory_world_rc: Sequence[tuple[int, int]],
+) -> dict[str, Any]:
+    """Summarize final belief values over unique robot-center cells."""
+    trajectory = list(
+        dict.fromkeys(
+            (int(state[0]), int(state[1]))
+            for state in trajectory_world_rc
+        )
+    )
+    obstacle_count = 0
+    origin_row, origin_col = (
+        int(cum_map.origin_world_rc[0]),
+        int(cum_map.origin_world_rc[1]),
+    )
+    for world_row, world_col in trajectory:
+        array_row = world_row - origin_row
+        array_col = world_col - origin_col
+        if (
+            0 <= array_row < int(cum_map.map.shape[0])
+            and 0 <= array_col < int(cum_map.map.shape[1])
+            and int(cum_map.map[array_row, array_col]) == OBSTACLE
+        ):
+            obstacle_count += 1
+    cell_count = len(trajectory)
+    return {
+        "final_trajectory_cell_count": cell_count,
+        "final_trajectory_obstacle_count": obstacle_count,
+        "final_trajectory_obstacle_ratio": (
+            float(obstacle_count) / float(cell_count)
+            if cell_count
+            else 0.0
+        ),
+    }
+
+
+def safety_fallback_diagnostics(
+    steps: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize fallback use over successful motion steps."""
+    successful_steps = [
+        step for step in steps if bool(step.get("step_success"))
+    ]
+    fallback_count = sum(
+        1
+        for step in successful_steps
+        if bool(step.get("safety_fallback_used"))
+    )
+    return {
+        "safety_fallback_total_count": fallback_count,
+        "safety_fallback_rate": (
+            float(fallback_count) / float(len(successful_steps))
+            if successful_steps
+            else 0.0
+        ),
+    }
 
 
 def belief_evidence_image(
@@ -772,6 +833,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "belief_map_shape": None,
             "origin_world_rc": None,
             "final_agent_state": None,
+            "final_trajectory_cell_count": 0,
+            "final_trajectory_obstacle_count": 0,
+            "final_trajectory_obstacle_ratio": 0.0,
+            "safety_fallback_total_count": 0,
+            "safety_fallback_rate": 0.0,
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
@@ -1732,14 +1798,22 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "success": success,
             }
         )
+        trajectory = episode_trajectory_states(steps)
+        self.experiment_result.update(safety_fallback_diagnostics(steps))
         try:
-            trajectory = episode_trajectory_states(steps)
             if trajectory:
                 self.experiment_result["final_agent_state"] = list(
                     trajectory[-1]
                 )
             final_cum_map = getattr(self, "_final_cum_map", None)
             if final_cum_map is not None:
+                record_traversed_cells_as_free(final_cum_map, trajectory)
+                self.experiment_result.update(
+                    final_trajectory_belief_diagnostics(
+                        final_cum_map,
+                        trajectory,
+                    )
+                )
                 evidence_result_path = self.choose_result_path()
                 evidence_metadata = export_belief_evidence(
                     final_cum_map,
