@@ -3,6 +3,7 @@
 import math
 
 import numpy as np
+import pytest
 from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_conservative_belief import (
@@ -27,6 +28,17 @@ def make_scan(distance, angle=0.0):
     scan.range_min = 0.05
     scan.range_max = 10.0
     scan.ranges = [distance]
+    return scan
+
+
+def make_multi_scan(distances, angle_min=0.0, angle_increment=1.0):
+    """Create a raw scan with explicit beam geometry."""
+    scan = LaserScan()
+    scan.angle_min = angle_min
+    scan.angle_increment = angle_increment
+    scan.range_min = 0.05
+    scan.range_max = 10.0
+    scan.ranges = list(distances)
     return scan
 
 
@@ -145,6 +157,51 @@ def test_single_lidar_hit_marks_the_whole_drl_cell_obstacle():
     assert observation.local_snap[10, 10] == OBSTACLE
 
 
+@pytest.mark.parametrize("distance", [math.inf, math.nan, 0.04, 10.01])
+def test_invalid_ray_does_not_create_a_free_corridor(distance):
+    """An invalid beam contributes neither free nor obstacle evidence."""
+    observation = project(make_scan(distance), laser_x=0.0)
+
+    expected = np.full((21, 21), INVISIBLE, dtype=np.int8)
+    expected[10, 10] = EMPTY
+    np.testing.assert_array_equal(observation.local_snap, expected)
+    assert observation.obstacle_cells == frozenset()
+
+
+def test_valid_obstacle_ray_clears_only_cells_before_endpoint():
+    """A valid beam marks free cells only on its pre-hit segment."""
+    observation = project(make_scan(1.0), laser_x=0.0)
+
+    np.testing.assert_array_equal(
+        observation.local_snap[10, 10:13],
+        np.full(3, EMPTY, dtype=np.int8),
+    )
+    assert observation.local_snap[10, 13] == OBSTACLE
+    assert observation.obstacle_cells == frozenset({(60, 63)})
+
+
+def test_cells_behind_valid_obstacle_remain_invisible():
+    """No free evidence is projected beyond a valid endpoint."""
+    observation = project(make_scan(1.0), laser_x=0.0)
+
+    np.testing.assert_array_equal(
+        observation.local_snap[10, 14:],
+        np.full(7, INVISIBLE, dtype=np.int8),
+    )
+
+
+def test_mixed_valid_and_invalid_rays_preserve_valid_observation():
+    """Invalid beams add no evidence beside a valid beam projection."""
+    valid_only = project(make_scan(1.0), laser_x=0.0)
+    mixed = project(
+        make_multi_scan([1.0, math.inf], angle_increment=math.pi / 2.0),
+        laser_x=0.0,
+    )
+
+    np.testing.assert_array_equal(mixed.local_snap, valid_only.local_snap)
+    assert mixed.obstacle_cells == valid_only.obstacle_cells
+
+
 def test_empty_cell_is_promoted_to_obstacle():
     """A later reliable hit promotes a previously free cell."""
     belief = BeliefCacheHarness()
@@ -157,8 +214,8 @@ def test_empty_cell_is_promoted_to_obstacle():
     assert stats.promoted_from_invisible == 0
 
 
-def test_obstacle_is_not_cleared_by_a_later_free_ray():
-    """A free-only observation cannot demote a persistent obstacle."""
+def test_invalid_ray_does_not_reset_a_known_obstacle():
+    """An invalid beam cannot demote persistent cumulative evidence."""
     belief = BeliefCacheHarness()
     promote_observed_obstacle_cells(belief, {ORIGIN_STATE})
     free_observation = project(make_scan(math.inf), laser_x=0.0)

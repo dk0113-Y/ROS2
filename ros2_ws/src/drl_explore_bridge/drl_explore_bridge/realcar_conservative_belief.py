@@ -128,17 +128,15 @@ def project_scan_to_belief(
 
     for index, raw_range in enumerate(scan.ranges):
         hit_range = float(raw_range)
-        hit_obstacle = (
+        if not (
             math.isfinite(hit_range)
             and float(scan.range_min) <= hit_range <= float(scan.range_max)
-        )
-        ray_range = hit_range if hit_obstacle else float(scan.range_max)
+        ):
+            continue
+
+        ray_range = hit_range
         ray_range = min(max(0.0, ray_range), local_radius_m + cell_size)
-        free_end = (
-            max(0.0, ray_range - cell_size * 0.25)
-            if hit_obstacle
-            else ray_range
-        )
+        free_end = max(0.0, ray_range - cell_size * 0.25)
         world_yaw = (
             float(robot_yaw)
             + float(laser_yaw_in_base)
@@ -166,7 +164,7 @@ def project_scan_to_belief(
                 mark_world(free_x, free_y, EMPTY)
             distance += sample_step
 
-        if hit_obstacle and hit_range <= local_radius_m + cell_size:
+        if hit_range <= local_radius_m + cell_size:
             hit_x = laser_origin_x + hit_range * ray_cos
             hit_y = laser_origin_y + hit_range * ray_sin
             hit_cell = continuous_world_to_grid(
