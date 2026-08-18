@@ -215,7 +215,7 @@ fresh observation -> cumulative belief -> policy inference
   -> refreshed-scan distance-aware gate
   -> final action + refreshed-odom grid-center target
   -> optional motion with drive-phase dynamic obstacle stop
-  -> odom-derived actual state -> belief-side termination
+  -> odom-derived actual state -> belief-side termination/replan
 ```
 
 真实世界完成判据只使用累计 belief：known cells、frontier 和其增长历史。传给
@@ -254,9 +254,32 @@ swept_volume = center-line segment (+) radius-0.20m circle
 收到一组新 scan/odom 后，用中心线长度
 `dynamic_stop_distance - footprint_radius_m = 0.05m` 的短 capsule 检查，保持前缘
 `0.25m`。侧向进入 `0.20m` 或正前方进入
-`0.25m` 都会先发布零速度并以 `dynamic_obstacle_stop` 中止；合法 `0.40m` 通道边界
-不会仅因侧墙存在而停止。进入 rotate phase 前还会用长度为 0 的全周圆形 footprint
-再检查一次，footprint 内有有效障碍点时 fail-stop，禁止开始旋转。
+`0.25m` 都会立即发布零速度并中断当前动作；合法 `0.40m` 通道边界不会仅因侧墙
+存在而停止。进入 rotate phase 前还会用长度为 0 的全周圆形 footprint 再检查一次，
+footprint 内有有效障碍点时 fail-stop，禁止开始旋转。
+
+动态 footprint 停车是可恢复的当前动作中断，不再直接等同于整个 exploration episode
+失败。底层检测仍先执行 `stop(repeat=3)`；control loop 捕获事件后再次发送零速，并在
+停车后调用既有 scan/odom refresh barrier。只有 scan sequence 和 odom sequence 都严格
+大于停后 barrier、接收时刻也在 barrier 之后且既有 receive/header freshness 检查全部通过，
+才记录停后 pose 和 odom-derived agent state。该 fresh pair 成为下一 decision 的 observation，
+更新 cumulative belief 后重新执行 policy inference、pre-motion refresh 和完整 safety gate；
+旧 target 不会继续执行。中断 step 保留曾尝试的 `executed_action` 和实际位移，但
+`step_success=false`、`failure_reason=dynamic_obstacle_stop_recovered`，且不会进入 completed
+`executed_action_history` 或增加 `successful_steps`。scan/odom 任一不前进、超时或 timestamp
+stale 都会保持零速并以 `sensor_failure` 结束。
+
+独立参数 `dynamic_stop_recovery_limit` 默认是 3，表示连续第 1、2 次 dynamic stop 完成
+停后 fresh observation 后继续 replan；连续第 3 次仍先停车、等待并记录停后 fresh
+scan/odom 和实际 pose，但不再进入下一次 policy decision，最终
+`termination_reason=dynamic_stop_deadlock`。一次完整成功的后续 motion 会把连续计数重置为
+0；该计数不复用 `no_safe_action_retries`。step JSON 记录
+`dynamic_stop_recovered`、`dynamic_stop_recovery_index`、
+`consecutive_dynamic_stop_count`、`post_dynamic_stop_pose`、
+`post_dynamic_stop_agent_state`、`recovery_scan_advanced`、
+`recovery_odom_advanced` 和 `recovery_refresh_duration_sec`；episode JSON 汇总
+`dynamic_stop_total_count`、`dynamic_stop_recovery_total_count` 和
+`dynamic_stop_deadlock`。
 
 正常完成只有满足最小决策步数、最小 known-area 后的 `frontier_exhausted`。此外还会
 检测 belief stagnation、重复 state 且信息不增长的 deadlock，并以 `max_steps`、

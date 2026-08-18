@@ -1,17 +1,28 @@
 """Targeted unit tests for the guarded Round 8 continuous runner."""
 
 import math
+import sys
 import threading
+import time
+import types
 
 import numpy as np
 import pytest
+import torch
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
-from drl_explore_bridge.realcar_action_adapter import RealcarActionAdapter
+from drl_explore_bridge.realcar_action_adapter import (
+    ActionExecutionTarget,
+    RealcarActionAdapter,
+)
+from drl_explore_bridge import (
+    realcar_policy_continuous_runner_node as continuous_runner_module,
+)
 from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     CONTINUOUS_CELL_SIZE_M,
     CONTINUOUS_DEFAULT_MAX_STEPS,
+    DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT,
     DEFAULT_FOOTPRINT_RADIUS_M,
     DEFAULT_LASER_X_IN_BASE_M,
     DEFAULT_LASER_Y_IN_BASE_M,
@@ -335,6 +346,349 @@ class RotationHarness:
         self.stop_calls += 1
 
 
+class QuietLogger:
+    """Collect runner log calls without writing test output."""
+
+    def __init__(self):
+        self.messages = []
+
+    def warn(self, message):
+        """Record a warning."""
+        self.messages.append(("warn", str(message)))
+
+    def error(self, message):
+        """Record an error."""
+        self.messages.append(("error", str(message)))
+
+
+class PolicyStateAdapter:
+    """Record the odom-derived state and trajectory passed to inference."""
+
+    def __init__(self):
+        self.states = []
+        self.trajectories = []
+
+    def build_single_state_tensors(
+        self,
+        cum_map,
+        agent_state,
+        recent_trajectory_positions,
+        return_state_meta,
+    ):
+        """Return an empty model input after recording policy state."""
+        del cum_map
+        assert return_state_meta
+        self.states.append(tuple(agent_state))
+        self.trajectories.append(list(recent_trajectory_positions))
+        return {}, {}
+
+
+class SequencedPolicyModel:
+    """Return a different deterministic action on each inference."""
+
+    def __init__(self, actions, events):
+        self.actions = list(actions)
+        self.events = events
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        """Return one ranked eight-action tensor."""
+        del kwargs
+        action = self.actions[self.calls]
+        self.calls += 1
+        self.events.append(("inference", action))
+        values = torch.arange(8, dtype=torch.float32) * -0.01
+        values[action] = 1.0
+        return values.unsqueeze(0)
+
+
+class FakeCumulativeBeliefMap:
+    """Provide a stable non-terminating cumulative-belief surface."""
+
+    def __init__(self, true_grid, agent_state, snap):
+        del true_grid, agent_state, snap
+        self.map = np.zeros((3, 3), dtype=np.int8)
+
+    def update(self, agent_state, snap):
+        """Accept subsequent real-state observations."""
+        del agent_state, snap
+
+    def get_frontier_u8(self):
+        """Keep a frontier present so the harness reaches its step cap."""
+        return np.ones((3, 3), dtype=np.uint8)
+
+
+class SubscriptionHarness:
+    """Model an attached cmd_vel subscriber."""
+
+    def get_subscription_count(self):
+        """Report one subscriber."""
+        return 1
+
+
+class ContinuousRunHarness(RealcarPolicyContinuousRunner):
+    """Run the production state machine with deterministic sensor events."""
+
+    def __init__(
+        self,
+        motion_outcomes,
+        recovery_modes=None,
+        dynamic_stop_recovery_limit=3,
+        safe_plan=True,
+    ):
+        self.checkpoint_path = "unused.pt"
+        self.max_steps = max(1, len(motion_outcomes))
+        self.max_runtime_sec = 60.0
+        self.experiment_started_monotonic = time.monotonic()
+        self.commissioning_mode = False
+        self.commissioning_action_idx = -1
+        self.execute = True
+        self.no_safe_action_retries = 0
+        self.dynamic_stop_recovery_limit = dynamic_stop_recovery_limit
+        self.cell_size = CONTINUOUS_CELL_SIZE_M
+        self.odom_state_origin = None
+        self.motion_outcomes = list(motion_outcomes)
+        self.recovery_modes = list(recovery_modes or [])
+        self.safe_plan = safe_plan
+        self.motion_index = 0
+        self.recovery_index = 0
+        self.recovery_pending = False
+        self.events = []
+        self.zero_commands = []
+        self.logger = QuietLogger()
+        self.cmd_pub = SubscriptionHarness()
+        self.action_adapter = RealcarActionAdapter(
+            ACTIONS_8,
+            ACTION_NAMES,
+            "grid_center",
+        )
+        self.scan_sequence = 1
+        self.odom_sequence = 1
+        self.latest_scan = make_scan(2.0)
+        self.latest_odom = make_odom()
+        self.latest_scan_received_at = time.monotonic()
+        self.latest_odom_received_at = time.monotonic()
+        self._dynamic_step_record = None
+        self.experiment_result = {
+            "steps": [],
+            "dynamic_stop_total_count": 0,
+            "dynamic_stop_recovery_total_count": 0,
+            "dynamic_stop_deadlock": False,
+        }
+
+    def get_logger(self):
+        """Return the quiet test logger."""
+        return self.logger
+
+    def _belief_termination(self, *args):
+        """Keep the harness bounded only by its configured decision count."""
+        del args
+        return None
+
+    def begin_step_record(self, step_id):
+        """Create a production-shaped record without constructing a ROS node."""
+        record = {
+            "step_id": step_id,
+            "start_pose": None,
+            "duration": None,
+            "success": False,
+            "failure_reason": "in_progress",
+            "actual_distance": None,
+            "dynamic_obstacle_stop": False,
+            "dynamic_footprint_stop": False,
+            "dynamic_stop_recovered": False,
+            "dynamic_stop_recovery_index": None,
+            "consecutive_dynamic_stop_count": 0,
+            "post_dynamic_stop_pose": None,
+            "post_dynamic_stop_agent_state": None,
+            "recovery_scan_advanced": False,
+            "recovery_odom_advanced": False,
+            "recovery_refresh_duration_sec": None,
+        }
+        self.experiment_result["steps"].append(record)
+        return record, time.monotonic()
+
+    def finish_step_record(
+        self,
+        record,
+        started_monotonic,
+        success,
+        failure_reason,
+    ):
+        """Finish the fields needed to audit interrupted motion."""
+        if record["duration"] is not None:
+            return
+        end_pose = self.pose_record_from_odom(self.latest_odom)
+        start_pose = record["start_pose"]
+        actual_distance = None
+        if start_pose is not None:
+            actual_distance = math.hypot(
+                end_pose["x"] - start_pose["x"],
+                end_pose["y"] - start_pose["y"],
+            )
+        record.update(
+            {
+                "end_pose": end_pose,
+                "actual_distance": actual_distance,
+                "success": bool(success),
+                "step_success": bool(success),
+                "failure_reason": failure_reason,
+                "duration": time.monotonic() - started_monotonic,
+            }
+        )
+
+    def _log_continuous_step(self, record):
+        """Record that the production loop finalized a decision attempt."""
+        self.events.append(("step_finished", record["step_id"]))
+
+    def consume_new_step_inputs(self):
+        """Consume the latest coherent pair, including a recovery pair."""
+        self.events.append(("consume", self.scan_sequence, self.odom_sequence))
+        return self.latest_scan, self.latest_odom
+
+    def build_local_snap(self, scan, odom):
+        """Return a minimal local observation."""
+        del scan, odom
+        return np.zeros((3, 3), dtype=np.int8)
+
+    def capture_sensor_refresh_barrier(self):
+        """Capture the pair after any preceding zero-stop calls."""
+        self.events.append(("barrier", self.scan_sequence, self.odom_sequence))
+        return SensorRefreshBarrier(
+            self.scan_sequence,
+            self.odom_sequence,
+            time.monotonic(),
+        )
+
+    def refresh_inputs_after_barrier(self, barrier):
+        """Advance both sensors or model a fail-stop recovery error."""
+        assert barrier.scan_sequence == self.scan_sequence
+        assert barrier.odom_sequence == self.odom_sequence
+        if self.recovery_pending:
+            mode = self.recovery_modes[self.recovery_index]
+            self.recovery_index += 1
+            self.events.append(("recovery_refresh", mode))
+            if mode in ("fresh", "scan_only", "stale"):
+                self.scan_sequence += 1
+                self.latest_scan_received_at = time.monotonic()
+            if mode in ("fresh", "odom_only", "stale"):
+                self.odom_sequence += 1
+                self.latest_odom_received_at = time.monotonic()
+            if mode == "scan_only":
+                raise TimeoutError("recovery /odom did not advance")
+            if mode == "odom_only":
+                raise TimeoutError("recovery /scan did not advance")
+            if mode == "stale":
+                raise RuntimeError("/scan timestamp is stale")
+            self.recovery_pending = False
+            return self.latest_scan, self.latest_odom
+
+        self.scan_sequence += 1
+        self.odom_sequence += 1
+        self.latest_scan_received_at = time.monotonic()
+        self.latest_odom_received_at = time.monotonic()
+        self.events.append(("pre_motion_refresh", self.motion_index))
+        return self.latest_scan, self.latest_odom
+
+    def sensor_age_diagnostics(self):
+        """Return coherent sequence diagnostics for recovery assertions."""
+        return {
+            "scan_sequence": self.scan_sequence,
+            "odom_sequence": self.odom_sequence,
+            "scan_receive_age_sec": 0.0,
+            "scan_header_age_sec": 0.0,
+            "odom_receive_age_sec": 0.0,
+            "odom_header_age_sec": 0.0,
+        }
+
+    def prepare_continuous_pre_motion_plan(
+        self,
+        raw_action,
+        q_ranked,
+        scan,
+        odom,
+        requested_action=None,
+        allow_fallback=True,
+    ):
+        """Build a safe fresh target or model the existing no-safe path."""
+        del q_ranked, scan, requested_action, allow_fallback
+        pose = self.pose_record_from_odom(odom)
+        target = self.action_adapter.target_for_action(
+            raw_action,
+            pose["x"],
+            pose["y"],
+            self.cell_size,
+        )
+        return ContinuousPreMotionPlan(
+            raw_policy_action=raw_action,
+            executed_action=raw_action if self.safe_plan else None,
+            target=target if self.safe_plan else None,
+            pre_motion_pose=pose,
+            target_distance=self.cell_size,
+            capsule_front_edge=0.60,
+            nearest_capsule_clearance=1.0,
+            pre_motion_footprint_passed=self.safe_plan,
+            obstruction_type=None if self.safe_plan else "no_safe_action",
+            gate_passed=self.safe_plan,
+            safety_fallback_used=False,
+        )
+
+    def execute_target(self, target: ActionExecutionTarget):
+        """Model partial interrupted motion or one completed motion."""
+        outcome = self.motion_outcomes[self.motion_index]
+        self.motion_index += 1
+        self.events.append(("execute", target.action_idx, outcome))
+        if outcome == "dynamic":
+            self.latest_odom = make_odom(x=0.20, y=0.0)
+            self.scan_sequence += 1
+            self.odom_sequence += 1
+            self._dynamic_step_record["dynamic_obstacle_stop"] = True
+            self._dynamic_step_record["dynamic_footprint_stop"] = True
+            self.stop(repeat=3)
+            self.recovery_pending = True
+            raise DynamicObstacleStop("dynamic_footprint_stop")
+        self.latest_odom = make_odom(
+            x=float(self.latest_odom.pose.pose.position.x) + 0.35,
+            y=float(self.latest_odom.pose.pose.position.y),
+        )
+        self.scan_sequence += 1
+        self.odom_sequence += 1
+        return 0.0
+
+    def refresh_after_motion(self):
+        """Model the existing successful post-motion pair refresh."""
+        self.scan_sequence += 1
+        self.odom_sequence += 1
+
+    def pose_xy_yaw_time(self):
+        """Return the latest odom pose for production state derivation."""
+        pose = self.pose_record_from_odom(self.latest_odom)
+        return pose["x"], pose["y"], pose["yaw_rad"], pose["odom_timestamp"]
+
+    def stop(self, repeat=10):
+        """Record only zero commands and their position in the event stream."""
+        self.events.append(("stop", repeat))
+        self.zero_commands.extend([(0.0, 0.0)] * repeat)
+
+
+def install_continuous_run_dependencies(monkeypatch, harness, actions):
+    """Install deterministic model and belief dependencies for run tests."""
+    adapter = PolicyStateAdapter()
+    model = SequencedPolicyModel(actions, harness.events)
+    monkeypatch.setattr(
+        continuous_runner_module,
+        "load_policy_model",
+        lambda _path: (model, adapter, torch),
+    )
+    env_module = types.ModuleType("env")
+    core_module = types.ModuleType("env.core_cummap")
+    core_module.CumulativeBeliefMap = FakeCumulativeBeliefMap
+    env_module.core_cummap = core_module
+    monkeypatch.setitem(sys.modules, "env", env_module)
+    monkeypatch.setitem(sys.modules, "env.core_cummap", core_module)
+    return model, adapter
+
+
 def test_continuous_cell_size_is_035():
     assert CONTINUOUS_CELL_SIZE_M == pytest.approx(0.35)
 
@@ -378,6 +732,10 @@ def test_continuous_default_step_distance_is_cell_size():
 
 def test_continuous_loop_has_a_finite_default_step_cap():
     assert 1 <= CONTINUOUS_DEFAULT_MAX_STEPS <= 1000
+
+
+def test_dynamic_stop_recovery_limit_defaults_to_three():
+    assert DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT == 3
 
 
 def test_continuous_sensor_callback_groups_are_independent():
@@ -1029,3 +1387,192 @@ def test_sensor_failure_classifier_covers_refresh_timeout():
 def test_motion_requires_explicit_execute_even_with_safe_action():
     assert not motion_is_permitted(False, True, 2)
     assert motion_is_permitted(True, True, 2)
+
+
+def test_dynamic_stop_recovers_with_fresh_pair_and_new_inference(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["dynamic", "success"],
+        recovery_modes=["fresh"],
+    )
+    model, adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1, 2],
+    )
+
+    reason = harness.run()
+
+    assert reason == "max_steps_reached"
+    assert model.calls == 2
+    assert adapter.states == [(60, 60), (60, 61)]
+    assert adapter.trajectories[1][-1] == (60, 61)
+    first, second = harness.experiment_result["steps"]
+    assert first["raw_policy_action"] == 1
+    assert first["executed_action"] == 1
+    assert first["expected_grid_state"] == [59, 61]
+    assert first["post_dynamic_stop_agent_state"] == [60, 61]
+    assert first["actual_grid_state"] == [60, 61]
+    assert not first["grid_transition_match"]
+    assert not first["step_success"]
+    assert first["failure_reason"] == "dynamic_obstacle_stop_recovered"
+    assert first["dynamic_stop_recovered"]
+    assert first["recovery_scan_advanced"]
+    assert first["recovery_odom_advanced"]
+    assert first["post_dynamic_stop_pose"]["x"] == pytest.approx(0.20)
+    assert second["raw_policy_action"] == 2
+    assert second["executed_action"] == 2
+    assert second["step_success"]
+    assert second["consecutive_dynamic_stop_count"] == 0
+    assert harness.experiment_result["executed_action_history"] == [2]
+    assert harness.experiment_result["dynamic_stop_total_count"] == 1
+    assert harness.experiment_result["dynamic_stop_recovery_total_count"] == 1
+    assert not harness.experiment_result["dynamic_stop_deadlock"]
+    assert all(command == (0.0, 0.0) for command in harness.zero_commands)
+    first_execute = harness.events.index(("execute", 1, "dynamic"))
+    first_barrier = next(
+        index
+        for index, event in enumerate(harness.events)
+        if event[0] == "barrier" and index > first_execute
+    )
+    assert harness.events[first_execute + 1] == ("stop", 3)
+    assert harness.events[first_execute + 2] == ("stop", 3)
+    assert first_barrier == first_execute + 3
+
+
+@pytest.mark.parametrize(
+    ("recovery_mode", "scan_advanced", "odom_advanced"),
+    (
+        ("scan_only", True, False),
+        ("odom_only", False, True),
+    ),
+)
+def test_dynamic_stop_recovery_requires_scan_and_odom_advance(
+    monkeypatch,
+    recovery_mode,
+    scan_advanced,
+    odom_advanced,
+):
+    harness = ContinuousRunHarness(
+        ["dynamic"],
+        recovery_modes=[recovery_mode],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1],
+    )
+
+    reason = harness.run()
+
+    record = harness.experiment_result["steps"][0]
+    assert reason == "sensor_failure"
+    assert model.calls == 1
+    assert record["recovery_scan_advanced"] is scan_advanced
+    assert record["recovery_odom_advanced"] is odom_advanced
+    assert not record["dynamic_stop_recovered"]
+    assert record["failure_reason"].startswith("sensor_failure:")
+    assert all(command == (0.0, 0.0) for command in harness.zero_commands)
+
+
+def test_dynamic_stop_recovery_rejects_stale_post_stop_timestamp(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["dynamic"],
+        recovery_modes=["stale"],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1],
+    )
+
+    reason = harness.run()
+
+    record = harness.experiment_result["steps"][0]
+    assert reason == "sensor_failure"
+    assert model.calls == 1
+    assert record["recovery_scan_advanced"]
+    assert record["recovery_odom_advanced"]
+    assert "timestamp is stale" in record["failure_reason"]
+    assert not record["dynamic_stop_recovered"]
+
+
+def test_successful_motion_resets_consecutive_dynamic_stop_count(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["dynamic", "success", "dynamic"],
+        recovery_modes=["fresh", "fresh"],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1, 2, 3],
+    )
+
+    reason = harness.run()
+
+    records = harness.experiment_result["steps"]
+    assert reason == "max_steps_reached"
+    assert model.calls == 3
+    assert records[0]["dynamic_stop_recovery_index"] == 1
+    assert records[1]["step_success"]
+    assert records[1]["consecutive_dynamic_stop_count"] == 0
+    assert records[2]["dynamic_stop_recovery_index"] == 1
+    assert records[2]["consecutive_dynamic_stop_count"] == 1
+
+
+def test_three_consecutive_dynamic_stops_terminate_as_deadlock(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["dynamic", "dynamic", "dynamic", "success"],
+        recovery_modes=["fresh", "fresh", "fresh"],
+        dynamic_stop_recovery_limit=3,
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1, 2, 3],
+    )
+
+    reason = harness.run()
+
+    records = harness.experiment_result["steps"]
+    assert reason == "dynamic_stop_deadlock"
+    assert model.calls == 3
+    assert len(records) == 3
+    assert [record["dynamic_stop_recovery_index"] for record in records] == [
+        1,
+        2,
+        3,
+    ]
+    assert [record["dynamic_stop_recovered"] for record in records] == [
+        True,
+        True,
+        False,
+    ]
+    assert all(record["recovery_scan_advanced"] for record in records)
+    assert all(record["recovery_odom_advanced"] for record in records)
+    assert records[-1]["failure_reason"] == "dynamic_stop_deadlock"
+    assert harness.experiment_result["dynamic_stop_total_count"] == 3
+    assert harness.experiment_result["dynamic_stop_recovery_total_count"] == 2
+    assert harness.experiment_result["dynamic_stop_deadlock"]
+    assert harness.experiment_result["executed_action_history"] == []
+    assert all(command == (0.0, 0.0) for command in harness.zero_commands)
+
+
+def test_pre_motion_no_safe_action_still_terminates_without_recovery(
+    monkeypatch,
+):
+    harness = ContinuousRunHarness(["success"], safe_plan=False)
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [1],
+    )
+
+    reason = harness.run()
+
+    assert reason == "no_safe_action"
+    assert model.calls == 1
+    assert harness.motion_index == 0
+    assert harness.experiment_result["dynamic_stop_total_count"] == 0
+    record = harness.experiment_result["steps"][0]
+    assert record["failure_reason"] == "no_safe_action"
+    assert not record["dynamic_stop_recovered"]

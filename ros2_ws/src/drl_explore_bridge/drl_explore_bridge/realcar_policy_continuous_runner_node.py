@@ -42,6 +42,7 @@ CONTINUOUS_DEFAULT_MAX_STEPS = 30
 CONTINUOUS_MAX_STEPS_LIMIT = 1000
 DEFAULT_MOTION_CLEARANCE_MARGIN_M = 0.25
 DEFAULT_DYNAMIC_STOP_DISTANCE_M = 0.25
+DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT = 3
 DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M = 0.40
 DEFAULT_FOOTPRINT_RADIUS_M = 0.20
 DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M = 0.05
@@ -409,6 +410,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.declare_parameter("deadlock_maximum_unique_states", 2)
         self.declare_parameter("deadlock_min_known_growth", 1)
         self.declare_parameter("no_safe_action_retries", 0)
+        self.declare_parameter(
+            "dynamic_stop_recovery_limit",
+            DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT,
+        )
         self.declare_parameter("drive_sensor_cycle_timeout_sec", 0.25)
         self.declare_parameter("commissioning_mode", False)
         self.declare_parameter("commissioning_action_idx", -1)
@@ -468,6 +473,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.no_safe_action_retries = int(
             self.get_parameter("no_safe_action_retries").value
         )
+        self.dynamic_stop_recovery_limit = int(
+            self.get_parameter("dynamic_stop_recovery_limit").value
+        )
         self.drive_sensor_cycle_timeout_sec = float(
             self.get_parameter("drive_sensor_cycle_timeout_sec").value
         )
@@ -525,6 +533,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 ),
                 "deadlock_min_known_growth": self.deadlock_min_known_growth,
                 "no_safe_action_retries": self.no_safe_action_retries,
+                "dynamic_stop_recovery_limit": (
+                    self.dynamic_stop_recovery_limit
+                ),
                 "disable_completion_termination_in_dryrun": (
                     self.disable_completion_termination_in_dryrun
                 ),
@@ -552,6 +563,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "episode_duration": 0.0,
             "termination_reason": "not_started",
             "success": False,
+            "dynamic_stop_total_count": 0,
+            "dynamic_stop_recovery_total_count": 0,
+            "dynamic_stop_deadlock": False,
             "steps": [],
         }
         self.get_logger().warn(
@@ -577,6 +591,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "drive_sensor_cycle_timeout_sec="
             f"{self.drive_sensor_cycle_timeout_sec:.3f} "
             "drive_sensor_watchdog_status=engineering_watchdog "
+            "dynamic_stop_recovery_limit="
+            f"{self.dynamic_stop_recovery_limit} "
             f"commissioning_mode={self.commissioning_mode} "
             f"commissioning_action_idx={self.commissioning_action_idx} "
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
@@ -791,6 +807,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError("deadlock_min_known_growth must be >= 0")
         if self.no_safe_action_retries < 0:
             raise ValueError("no_safe_action_retries must be >= 0")
+        if self.dynamic_stop_recovery_limit < 1:
+            raise ValueError("dynamic_stop_recovery_limit must be >= 1")
         if self.drive_sensor_cycle_timeout_sec <= 0.0:
             raise ValueError("drive_sensor_cycle_timeout_sec must be > 0")
         validate_commissioning_config(
@@ -1194,6 +1212,14 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "dynamic_obstacle_stop": False,
                 "dynamic_footprint_stop": False,
                 "dynamic_nearest_capsule_clearance": None,
+                "dynamic_stop_recovered": False,
+                "dynamic_stop_recovery_index": None,
+                "consecutive_dynamic_stop_count": 0,
+                "post_dynamic_stop_pose": None,
+                "post_dynamic_stop_agent_state": None,
+                "recovery_scan_advanced": False,
+                "recovery_odom_advanced": False,
+                "recovery_refresh_duration_sec": None,
                 "drive_sensor_cycle_timeout_sec": (
                     self.drive_sensor_cycle_timeout_sec
                 ),
@@ -1276,6 +1302,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"total_steps={len(steps)} "
             f"successful_steps={self.experiment_result['successful_steps']} "
             f"travel_distance={self._episode_travel_distance:.3f} "
+            "dynamic_stop_total_count="
+            f"{self.experiment_result['dynamic_stop_total_count']} "
+            "dynamic_stop_recovery_total_count="
+            f"{self.experiment_result['dynamic_stop_recovery_total_count']} "
+            "dynamic_stop_deadlock="
+            f"{self.experiment_result['dynamic_stop_deadlock']} "
             f"termination_reason={exit_reason} "
             f"success={str(success).lower()} "
             f"result_file={result_path or 'not_saved'}"
@@ -1369,6 +1401,21 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"dynamic_footprint_stop={record['dynamic_footprint_stop']} "
             "dynamic_nearest_capsule_clearance="
             f"{format_optional_float(record['dynamic_nearest_capsule_clearance'])} "
+            "dynamic_stop_recovered="
+            f"{record['dynamic_stop_recovered']} "
+            "dynamic_stop_recovery_index="
+            f"{record['dynamic_stop_recovery_index']} "
+            "consecutive_dynamic_stop_count="
+            f"{record['consecutive_dynamic_stop_count']} "
+            "post_dynamic_stop_agent_state="
+            f"{record['post_dynamic_stop_agent_state']} "
+            f"post_dynamic_stop_pose={record['post_dynamic_stop_pose']} "
+            "recovery_scan_advanced="
+            f"{record['recovery_scan_advanced']} "
+            "recovery_odom_advanced="
+            f"{record['recovery_odom_advanced']} "
+            "recovery_refresh_duration_sec="
+            f"{format_optional_float(record['recovery_refresh_duration_sec'])} "
             "drive_sensor_cycle_count="
             f"{record['drive_sensor_cycle_count']} "
             "drive_sensor_cycle_max_wait_sec="
@@ -1410,6 +1457,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         frontier_history: list[int] = []
         cum_map = None
         no_safe_action_count = 0
+        consecutive_dynamic_stop_count = 0
 
         for step_id in range(self.max_steps):
             limit_reason = hard_limit_termination(
@@ -1640,6 +1688,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 action_history.append(plan.executed_action)
                 recent_positions.append(actual_state)
                 recent_positions = recent_positions[-8:]
+                consecutive_dynamic_stop_count = 0
+                record["consecutive_dynamic_stop_count"] = 0
                 self.finish_step_record(record, step_started, True, None)
                 self._log_continuous_step(record)
                 successful_termination = successful_step_termination_reason(
@@ -1660,17 +1710,123 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 )
                 raise
             except DynamicObstacleStop as exc:
-                self.stop()
-                record.update(self.sensor_age_diagnostics())
+                self.stop(repeat=3)
+                consecutive_dynamic_stop_count += 1
+                self.experiment_result["dynamic_stop_total_count"] += 1
+                record.update(
+                    {
+                        "dynamic_stop_recovery_index": (
+                            consecutive_dynamic_stop_count
+                        ),
+                        "consecutive_dynamic_stop_count": (
+                            consecutive_dynamic_stop_count
+                        ),
+                    }
+                )
+                recovery_barrier = self.capture_sensor_refresh_barrier()
+                recovery_started = time.monotonic()
+                recovery_error: Optional[Exception] = None
+                recovered_odom: Optional[Odometry] = None
+                try:
+                    _recovered_scan, recovered_odom = (
+                        self.refresh_inputs_after_barrier(recovery_barrier)
+                    )
+                except Exception as refresh_exc:
+                    recovery_error = refresh_exc
+                finally:
+                    record["recovery_refresh_duration_sec"] = (
+                        time.monotonic() - recovery_started
+                    )
+                    recovery_diagnostics = self.sensor_age_diagnostics()
+                    record.update(recovery_diagnostics)
+                    record["recovery_scan_advanced"] = (
+                        int(recovery_diagnostics["scan_sequence"])
+                        > recovery_barrier.scan_sequence
+                    )
+                    record["recovery_odom_advanced"] = (
+                        int(recovery_diagnostics["odom_sequence"])
+                        > recovery_barrier.odom_sequence
+                    )
+
+                if recovery_error is not None:
+                    self.stop(repeat=3)
+                    self.finish_step_record(
+                        record,
+                        step_started,
+                        False,
+                        f"sensor_failure: {recovery_error}",
+                    )
+                    self._log_continuous_step(record)
+                    self.get_logger().error(
+                        "dynamic-stop recovery sensor failure: "
+                        f"{recovery_error}"
+                    )
+                    return "sensor_failure"
+
+                if recovered_odom is None:
+                    self.stop(repeat=3)
+                    self.finish_step_record(
+                        record,
+                        step_started,
+                        False,
+                        "sensor_failure: missing recovered /odom",
+                    )
+                    self._log_continuous_step(record)
+                    return "sensor_failure"
+
+                post_stop_pose = self.pose_record_from_odom(recovered_odom)
+                post_stop_state = self.agent_state_from_odom(
+                    origin_state,
+                    post_stop_pose["x"],
+                    post_stop_pose["y"],
+                )
+                record.update(
+                    {
+                        "post_dynamic_stop_pose": post_stop_pose,
+                        "post_dynamic_stop_agent_state": list(post_stop_state),
+                        "actual_grid_state": list(post_stop_state),
+                        "grid_transition_match": grid_transition_matches(
+                            tuple(record["expected_grid_state"]),
+                            post_stop_state,
+                        ),
+                    }
+                )
+                recent_positions.append(post_stop_state)
+                recent_positions = recent_positions[-8:]
+
+                if (
+                    consecutive_dynamic_stop_count
+                    >= self.dynamic_stop_recovery_limit
+                ):
+                    self.experiment_result["dynamic_stop_deadlock"] = True
+                    self.finish_step_record(
+                        record,
+                        step_started,
+                        False,
+                        "dynamic_stop_deadlock",
+                    )
+                    self._log_continuous_step(record)
+                    self.get_logger().error(
+                        f"{exc}; dynamic-stop recovery limit reached"
+                    )
+                    return "dynamic_stop_deadlock"
+
+                record["dynamic_stop_recovered"] = True
+                self.experiment_result[
+                    "dynamic_stop_recovery_total_count"
+                ] += 1
                 self.finish_step_record(
                     record,
                     step_started,
                     False,
-                    "dynamic_obstacle_stop",
+                    "dynamic_obstacle_stop_recovered",
                 )
                 self._log_continuous_step(record)
-                self.get_logger().error(str(exc))
-                return "dynamic_obstacle_stop"
+                self.get_logger().warn(
+                    f"{exc}; abandoning target and replanning from "
+                    f"post-stop agent_state={post_stop_state}"
+                )
+                continue
             except RotationFootprintBlocked as exc:
                 self.stop()
                 record.update(self.sensor_age_diagnostics())
