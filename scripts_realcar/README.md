@@ -225,6 +225,15 @@ true-map coverage。累计 belief 本身可动态扩展，Round 8 的 odom 派�
 实际 policy state 始终由相对 episode 起点的累计 odom 位移量化，二者不一致时记录
 `grid_transition_match=false`，不会强制移动抽象状态。
 
+实机 belief 使用 deployment-only 的 obstacle-dominant fusion。raw `/scan` hit 先通过
+当前连续 odom pose 和 `base_footprint -> laser` 外参得到连续 odom-world 坐标，再以
+episode 首帧 odom 对应 `(60,60)` 为栅格中心锚点量化到 `0.35m` global cell；投影前不会
+把机器人吸附到当前 cell center。命中过的 cell 可从 `EMPTY` 提升为 `OBSTACLE`，且后续
+free ray 不会把它清回 `EMPTY`。每个 decision 记录
+`obstacle_promotions_this_step` 和 `obstacle_promotions_total`；promotion 通过累计 map 的
+dirty-frontier/cache invalidation 接口完成。该融合只在 continuous realcar runner 中调用，
+不改变 DRL 仓库的训练/evaluation `CumulativeBeliefMap` 默认更新语义。
+
 continuous runner 的部署安全层使用显式圆形 safety footprint：
 
 ```text

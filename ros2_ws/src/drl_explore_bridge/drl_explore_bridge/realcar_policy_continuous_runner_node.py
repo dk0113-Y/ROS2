@@ -24,6 +24,11 @@ from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
+from drl_explore_bridge.realcar_conservative_belief import (
+    ProjectedBeliefObservation,
+    project_scan_to_belief,
+    promote_observed_obstacle_cells,
+)
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
     INVISIBLE,
@@ -591,6 +596,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
+            "obstacle_promotions_total": 0,
             "local_escape_total_count": 0,
             "local_escape_success_total_count": 0,
             "local_escape_deadlock": False,
@@ -894,6 +900,34 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             self.cell_size,
         )
         return origin_state[0] + row_offset, origin_state[1] + col_offset
+
+    def build_belief_observation(
+        self,
+        scan: LaserScan,
+        odom: Odometry,
+        origin_state: tuple[int, int],
+        agent_state: tuple[int, int],
+    ) -> ProjectedBeliefObservation:
+        """Build a deployment belief observation from continuous geometry."""
+        if self.odom_state_origin is None:
+            raise RuntimeError("odom_state_origin is not initialized")
+        pose = self.pose_record_from_odom(odom)
+        origin_x, origin_y = self.odom_state_origin
+        return project_scan_to_belief(
+            scan,
+            robot_x=pose["x"],
+            robot_y=pose["y"],
+            robot_yaw=pose["yaw_rad"],
+            origin_x=origin_x,
+            origin_y=origin_y,
+            origin_state=origin_state,
+            agent_state=agent_state,
+            cell_size=self.cell_size,
+            scan_radius_cells=self.scan_radius_cells,
+            laser_x_in_base=self.laser_x_in_base_m,
+            laser_y_in_base=self.laser_y_in_base_m,
+            laser_yaw_in_base=self.laser_yaw_in_base,
+        )
 
     def target_for_action(
         self,
@@ -1383,6 +1417,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "known_cells": None,
                 "known_cells_delta": None,
                 "frontier_count": None,
+                "obstacle_promotions_this_step": 0,
+                "obstacle_promotions_total": self.experiment_result[
+                    "obstacle_promotions_total"
+                ],
                 "q_values": None,
                 "q_ranked": None,
                 "executed_action": None,
@@ -1520,6 +1558,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"{self.experiment_result['dynamic_stop_recovery_total_count']} "
             "dynamic_stop_deadlock="
             f"{self.experiment_result['dynamic_stop_deadlock']} "
+            "obstacle_promotions_total="
+            f"{self.experiment_result['obstacle_promotions_total']} "
             "local_escape_total_count="
             f"{self.experiment_result['local_escape_total_count']} "
             "local_escape_success_total_count="
@@ -1596,6 +1636,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"known_cells={record['known_cells']} "
             f"known_cells_delta={record['known_cells_delta']} "
             f"frontier_count={record['frontier_count']} "
+            "obstacle_promotions_this_step="
+            f"{record['obstacle_promotions_this_step']} "
+            "obstacle_promotions_total="
+            f"{record['obstacle_promotions_total']} "
             f"raw_policy_action={record['raw_policy_action']} "
             f"action_source={record['action_source']} "
             f"executed_action={record['executed_action']} "
@@ -1732,7 +1776,13 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 record["agent_state"] = list(agent_state)
 
                 state_started = time.monotonic()
-                snap = self.build_local_snap(scan, odom)
+                observation = self.build_belief_observation(
+                    scan,
+                    odom,
+                    origin_state,
+                    agent_state,
+                )
+                snap = observation.local_snap
                 if cum_map is None:
                     cum_map = CumulativeBeliefMap(
                         compatibility_true_grid,
@@ -1741,6 +1791,13 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     )
                 else:
                     cum_map.update(agent_state, snap)
+                promotion_stats = promote_observed_obstacle_cells(
+                    cum_map,
+                    observation.obstacle_cells,
+                )
+                self.experiment_result["obstacle_promotions_total"] += (
+                    promotion_stats.obstacle_promotions_this_step
+                )
                 known_cells, frontier_count = belief_statistics(cum_map)
                 known_delta = (
                     known_cells if not known_history
@@ -1751,6 +1808,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "known_cells": known_cells,
                         "known_cells_delta": known_delta,
                         "frontier_count": frontier_count,
+                        "obstacle_promotions_this_step": (
+                            promotion_stats.obstacle_promotions_this_step
+                        ),
+                        "obstacle_promotions_total": self.experiment_result[
+                            "obstacle_promotions_total"
+                        ],
                     }
                 )
                 state_history.append(agent_state)

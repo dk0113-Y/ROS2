@@ -16,6 +16,9 @@ from drl_explore_bridge.realcar_action_adapter import (
     ActionExecutionTarget,
     RealcarActionAdapter,
 )
+from drl_explore_bridge.realcar_conservative_belief import (
+    ProjectedBeliefObservation,
+)
 from drl_explore_bridge import (
     realcar_policy_continuous_runner_node as continuous_runner_module,
 )
@@ -549,6 +552,7 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
+            "obstacle_promotions_total": 0,
             "local_escape_total_count": 0,
             "local_escape_success_total_count": 0,
             "local_escape_deadlock": False,
@@ -647,6 +651,20 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         """Return a minimal local observation."""
         del scan, odom
         return np.zeros((3, 3), dtype=np.int8)
+
+    def build_belief_observation(
+        self,
+        scan,
+        odom,
+        origin_state,
+        agent_state,
+    ):
+        """Return a minimal hit-free deployment observation."""
+        del origin_state, agent_state
+        return ProjectedBeliefObservation(
+            self.build_local_snap(scan, odom),
+            frozenset(),
+        )
 
     def capture_sensor_refresh_barrier(self):
         """Capture the pair after any preceding zero-stop calls."""
