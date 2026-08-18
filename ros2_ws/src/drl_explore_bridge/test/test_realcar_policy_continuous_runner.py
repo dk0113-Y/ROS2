@@ -45,6 +45,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     capsule_footprint_check,
     drive_sensor_sequence_progress,
     episode_success_for_reason,
+    export_belief_evidence,
     expected_grid_state_from_action,
     frontier_exhausted,
     grid_transition_matches,
@@ -907,6 +908,54 @@ def install_continuous_run_dependencies(monkeypatch, harness, actions):
 
 def test_continuous_cell_size_is_035():
     assert CONTINUOUS_CELL_SIZE_M == pytest.approx(0.35)
+
+
+def test_belief_evidence_export_preserves_map_and_metadata(tmp_path):
+    class ExpandedBelief:
+        """Represent a belief whose dynamic origin moved during expansion."""
+
+        def __init__(self):
+            self.map = np.array(
+                [[-1, 0, 1], [0, 1, -1]],
+                dtype=np.int8,
+            )
+            self.origin_world_rc = (-14, 27)
+            self.frontier_u8 = np.array(
+                [[0, 255, 0], [1, 0, 0]],
+                dtype=np.uint8,
+            )
+
+        def get_frontier_u8(self):
+            raise AssertionError("export should read the canonical mask")
+
+    cum_map = ExpandedBelief()
+    map_before = cum_map.map.copy()
+    frontier_before = cum_map.frontier_u8.copy()
+    origin_before = cum_map.origin_world_rc
+    metadata = export_belief_evidence(
+        cum_map,
+        tmp_path / "episode.json",
+        [(-14, 27), (-13, 28)],
+    )
+
+    exported_belief = np.load(metadata["belief_map_path"], allow_pickle=False)
+    exported_frontier = np.load(
+        metadata["frontier_map_path"],
+        allow_pickle=False,
+    )
+    assert np.array_equal(exported_belief, map_before)
+    assert exported_belief.dtype == map_before.dtype
+    assert set(np.unique(exported_belief).tolist()) == {-1, 0, 1}
+    assert np.array_equal(exported_frontier, frontier_before)
+    assert metadata["belief_map_shape"] == [2, 3]
+    assert metadata["origin_world_rc"] == [-14, 27]
+    assert metadata["final_agent_state"] == [-13, 28]
+    assert np.array_equal(cum_map.map, map_before)
+    assert np.array_equal(cum_map.frontier_u8, frontier_before)
+    assert cum_map.origin_world_rc == origin_before
+    assert (tmp_path / "episode_belief.png").read_bytes().startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
 
 
 def test_continuous_footprint_defaults_define_040_corridor():

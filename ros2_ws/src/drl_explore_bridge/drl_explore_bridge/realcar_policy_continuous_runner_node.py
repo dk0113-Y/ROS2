@@ -43,6 +43,7 @@ from drl_explore_bridge.realcar_policy_safe_runner_node import (
 
 
 CONTINUOUS_CELL_SIZE_M = 0.35
+CONTINUOUS_ORIGIN_STATE = (60, 60)
 CONTINUOUS_DEFAULT_MAX_STEPS = 30
 CONTINUOUS_MAX_STEPS_LIMIT = 1000
 DEFAULT_MOTION_CLEARANCE_MARGIN_M = 0.25
@@ -380,6 +381,177 @@ def repository_commit(path: Path) -> str:
     return result.stdout.strip() or "unknown"
 
 
+def episode_trajectory_states(
+    steps: Sequence[dict[str, Any]],
+) -> list[tuple[int, int]]:
+    """Extract the observed and post-motion grid states in episode order."""
+    trajectory: list[tuple[int, int]] = []
+
+    def append_state(raw_state: Any) -> None:
+        if raw_state is None or len(raw_state) != 2:
+            return
+        state = (int(raw_state[0]), int(raw_state[1]))
+        if not trajectory or trajectory[-1] != state:
+            trajectory.append(state)
+
+    for step in steps:
+        append_state(step.get("agent_state"))
+        append_state(step.get("actual_grid_state"))
+    return trajectory
+
+
+def belief_evidence_image(
+    belief_map: np.ndarray,
+    frontier_map: np.ndarray,
+    origin_world_rc: tuple[int, int],
+    trajectory_world_rc: Sequence[tuple[int, int]],
+    scale: int = 6,
+) -> Any:
+    """Render belief semantics and the episode path without changing inputs."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("python3-pil is required for belief PNG export") from exc
+
+    belief = np.asarray(belief_map)
+    frontier = np.asarray(frontier_map)
+    if belief.ndim != 2:
+        raise ValueError("belief map must be two-dimensional")
+    if frontier.shape != belief.shape:
+        raise ValueError(
+            "frontier map shape must match belief map shape: "
+            f"{frontier.shape} != {belief.shape}"
+        )
+    if scale <= 0:
+        raise ValueError("PNG scale must be positive")
+
+    # unknown=gray, free=white, obstacle=black, frontier=yellow
+    cells = np.full((*belief.shape, 3), (127, 127, 127), dtype=np.uint8)
+    cells[belief == 0] = (245, 245, 245)
+    cells[belief == 1] = (20, 20, 20)
+    cells[frontier > 0] = (255, 205, 0)
+    map_image = Image.fromarray(cells, mode="RGB").resize(
+        (belief.shape[1] * scale, belief.shape[0] * scale),
+        resample=Image.NEAREST,
+    )
+    legend_width = 142
+    image = Image.new(
+        "RGB",
+        (map_image.width + legend_width, max(map_image.height, 148)),
+        (230, 230, 230),
+    )
+    image.paste(map_image, (0, 0))
+    draw = ImageDraw.Draw(image)
+
+    origin_r, origin_c = origin_world_rc
+
+    def state_center(state: tuple[int, int]) -> tuple[int, int]:
+        array_r = int(state[0]) - int(origin_r)
+        array_c = int(state[1]) - int(origin_c)
+        return (
+            array_c * scale + scale // 2,
+            array_r * scale + scale // 2,
+        )
+
+    centers = [state_center(state) for state in trajectory_world_rc]
+    if len(centers) > 1:
+        draw.line(centers, fill=(30, 100, 220), width=max(1, scale // 3))
+    if centers:
+        # The larger green start marker remains visible as a ring when the
+        # final state is the same cell; the smaller final marker is red.
+        start_radius = max(2, scale - 1)
+        final_radius = max(1, scale // 2)
+        for center, radius, color in (
+            (centers[0], start_radius, (0, 170, 70)),
+            (centers[-1], final_radius, (220, 30, 60)),
+        ):
+            draw.ellipse(
+                (
+                    center[0] - radius,
+                    center[1] - radius,
+                    center[0] + radius,
+                    center[1] + radius,
+                ),
+                fill=color,
+            )
+
+    legend_x = map_image.width + 10
+    legend = (
+        ("unknown", (127, 127, 127)),
+        ("free", (245, 245, 245)),
+        ("obstacle", (20, 20, 20)),
+        ("frontier", (255, 205, 0)),
+        ("trajectory", (30, 100, 220)),
+        ("start", (0, 170, 70)),
+        ("final", (220, 30, 60)),
+    )
+    for index, (label, color) in enumerate(legend):
+        top = 8 + index * 20
+        draw.rectangle((legend_x, top, legend_x + 12, top + 12), fill=color)
+        draw.text((legend_x + 18, top), label, fill=(0, 0, 0))
+    return image
+
+
+def export_belief_evidence(
+    cum_map: Any,
+    result_path: Path,
+    trajectory_world_rc: Sequence[tuple[int, int]],
+) -> dict[str, Any]:
+    """Export final read-only belief evidence beside an episode JSON path."""
+    belief = np.array(cum_map.map, copy=True)
+    frontier_source = getattr(cum_map, "frontier_u8", None)
+    if frontier_source is None:
+        frontier_source = cum_map.get_frontier_u8()
+    frontier = np.array(frontier_source, copy=True)
+    origin_world_rc = tuple(int(value) for value in cum_map.origin_world_rc)
+    trajectory = [
+        (int(state[0]), int(state[1])) for state in trajectory_world_rc
+    ]
+    if belief.ndim != 2:
+        raise ValueError("cum_map.map must be two-dimensional")
+    if frontier.shape != belief.shape:
+        raise ValueError(
+            "final frontier shape must match cum_map.map shape: "
+            f"{frontier.shape} != {belief.shape}"
+        )
+
+    belief_path = result_path.with_name(f"{result_path.stem}_belief.npy")
+    frontier_path = result_path.with_name(f"{result_path.stem}_frontier.npy")
+    png_path = result_path.with_name(f"{result_path.stem}_belief.png")
+    created_paths: list[Path] = []
+    try:
+        with belief_path.open("xb") as output:
+            created_paths.append(belief_path)
+            np.save(output, belief, allow_pickle=False)
+        with frontier_path.open("xb") as output:
+            created_paths.append(frontier_path)
+            np.save(output, frontier, allow_pickle=False)
+        visualization = belief_evidence_image(
+            belief,
+            frontier,
+            origin_world_rc,
+            trajectory,
+        )
+        with png_path.open("xb") as output:
+            created_paths.append(png_path)
+            visualization.save(output, format="PNG")
+    except Exception:
+        for created_path in created_paths:
+            created_path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "belief_map_path": str(belief_path),
+        "frontier_map_path": str(frontier_path),
+        "belief_visualization_path": str(png_path),
+        "belief_map_shape": [int(value) for value in belief.shape],
+        "origin_world_rc": [int(value) for value in origin_world_rc],
+        "final_agent_state": (
+            [int(value) for value in trajectory[-1]] if trajectory else None
+        ),
+    }
+
+
 class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
     """Run bounded, belief-terminated exploration with Round 8 safeguards."""
 
@@ -522,6 +694,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self._last_dynamic_scan_sequence = self.scan_sequence
         self._dynamic_step_record: Optional[dict[str, Any]] = None
         self._episode_travel_distance = 0.0
+        self._final_cum_map: Optional[Any] = None
 
         started_at = datetime.now().astimezone()
         repo_root = Path(__file__).resolve().parents[4]
@@ -593,6 +766,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "episode_duration": 0.0,
             "termination_reason": "not_started",
             "success": False,
+            "belief_map_path": None,
+            "frontier_map_path": None,
+            "belief_visualization_path": None,
+            "belief_map_shape": None,
+            "origin_world_rc": None,
+            "final_agent_state": None,
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
@@ -1507,6 +1686,19 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             failure_reason,
         )
         record["step_success"] = bool(record["success"])
+        if record.get("actual_grid_state") is None:
+            end_pose = record.get("end_pose")
+            if end_pose is not None:
+                try:
+                    final_state = self.agent_state_from_odom(
+                        CONTINUOUS_ORIGIN_STATE,
+                        float(end_pose["x"]),
+                        float(end_pose["y"]),
+                    )
+                except (KeyError, TypeError, ValueError, RuntimeError):
+                    pass
+                else:
+                    record["actual_grid_state"] = list(final_state)
 
     def finish_experiment(self, exit_reason: str) -> None:
         """Persist a bounded episode summary exactly once."""
@@ -1540,6 +1732,25 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "success": success,
             }
         )
+        try:
+            trajectory = episode_trajectory_states(steps)
+            if trajectory:
+                self.experiment_result["final_agent_state"] = list(
+                    trajectory[-1]
+                )
+            final_cum_map = getattr(self, "_final_cum_map", None)
+            if final_cum_map is not None:
+                evidence_result_path = self.choose_result_path()
+                evidence_metadata = export_belief_evidence(
+                    final_cum_map,
+                    evidence_result_path,
+                    trajectory,
+                )
+                self.experiment_result.update(evidence_metadata)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to export continuous belief evidence: {exc}"
+            )
         result_path: Optional[Path] = None
         try:
             result_path = self.save_experiment_result()
@@ -1735,13 +1946,14 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         from env.core_cummap import CumulativeBeliefMap
 
         compatibility_true_grid = np.zeros((120, 120), dtype=np.int8)
-        origin_state = (60, 60)
+        origin_state = CONTINUOUS_ORIGIN_STATE
         recent_positions = [origin_state]
         state_history: list[tuple[int, int]] = []
         action_history: list[int] = []
         known_history: list[int] = []
         frontier_history: list[int] = []
         cum_map = None
+        self._final_cum_map = None
         no_safe_action_count = 0
         consecutive_dynamic_stop_count = 0
         consecutive_local_escape_count = 0
@@ -1791,6 +2003,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     )
                 else:
                     cum_map.update(agent_state, snap)
+                self._final_cum_map = cum_map
                 promotion_stats = promote_observed_obstacle_cells(
                     cum_map,
                     observation.obstacle_cells,
