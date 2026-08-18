@@ -43,6 +43,8 @@ CONTINUOUS_MAX_STEPS_LIMIT = 1000
 DEFAULT_MOTION_CLEARANCE_MARGIN_M = 0.25
 DEFAULT_DYNAMIC_STOP_DISTANCE_M = 0.25
 DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT = 3
+DEFAULT_LOCAL_ESCAPE_RECOVERY_LIMIT = 3
+LOCAL_ESCAPE_CANDIDATE_DISTANCES_M = (0.20, 0.15, 0.10)
 DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M = 0.40
 DEFAULT_FOOTPRINT_RADIUS_M = 0.20
 DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M = 0.05
@@ -78,6 +80,19 @@ class ContinuousPreMotionPlan:
     obstruction_type: Optional[str]
     gate_passed: bool
     safety_fallback_used: bool
+
+
+@dataclass(frozen=True)
+class LocalEscapePlan:
+    """Describe one bounded deployment-only local recovery primitive."""
+
+    available: bool
+    action_idx: Optional[int]
+    distance_m: Optional[float]
+    target: Optional[ActionExecutionTarget]
+    pre_motion_pose: dict[str, float]
+    nearest_clearance: Optional[float]
+    candidate_evaluations: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -414,6 +429,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "dynamic_stop_recovery_limit",
             DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT,
         )
+        self.declare_parameter(
+            "local_escape_recovery_limit",
+            DEFAULT_LOCAL_ESCAPE_RECOVERY_LIMIT,
+        )
         self.declare_parameter("drive_sensor_cycle_timeout_sec", 0.25)
         self.declare_parameter("commissioning_mode", False)
         self.declare_parameter("commissioning_action_idx", -1)
@@ -476,6 +495,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.dynamic_stop_recovery_limit = int(
             self.get_parameter("dynamic_stop_recovery_limit").value
         )
+        self.local_escape_recovery_limit = int(
+            self.get_parameter("local_escape_recovery_limit").value
+        )
         self.drive_sensor_cycle_timeout_sec = float(
             self.get_parameter("drive_sensor_cycle_timeout_sec").value
         )
@@ -536,6 +558,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "dynamic_stop_recovery_limit": (
                     self.dynamic_stop_recovery_limit
                 ),
+                "local_escape_recovery_limit": (
+                    self.local_escape_recovery_limit
+                ),
                 "disable_completion_termination_in_dryrun": (
                     self.disable_completion_termination_in_dryrun
                 ),
@@ -566,6 +591,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
+            "local_escape_total_count": 0,
+            "local_escape_success_total_count": 0,
+            "local_escape_deadlock": False,
+            "local_escape_action_history": [],
             "steps": [],
         }
         self.get_logger().warn(
@@ -593,6 +622,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "drive_sensor_watchdog_status=engineering_watchdog "
             "dynamic_stop_recovery_limit="
             f"{self.dynamic_stop_recovery_limit} "
+            "local_escape_candidate_distances_m="
+            f"{list(LOCAL_ESCAPE_CANDIDATE_DISTANCES_M)} "
+            "local_escape_recovery_limit="
+            f"{self.local_escape_recovery_limit} "
             f"commissioning_mode={self.commissioning_mode} "
             f"commissioning_action_idx={self.commissioning_action_idx} "
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
@@ -733,6 +766,32 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             self.last_consumed_scan_sequence = self.scan_sequence
             self.last_consumed_odom_sequence = self.odom_sequence
 
+    def refresh_after_local_escape(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[LaserScan, Odometry]:
+        """Refresh both sensors after escape and record barrier diagnostics."""
+        barrier = self.capture_sensor_refresh_barrier()
+        started = time.monotonic()
+        try:
+            scan, odom = self.refresh_inputs_after_barrier(barrier)
+        finally:
+            record["local_escape_refresh_duration_sec"] = (
+                time.monotonic() - started
+            )
+            diagnostics = self.sensor_age_diagnostics()
+            record.update(diagnostics)
+            record["local_escape_refresh_scan_advanced"] = (
+                int(diagnostics["scan_sequence"]) > barrier.scan_sequence
+            )
+            record["local_escape_refresh_odom_advanced"] = (
+                int(diagnostics["odom_sequence"]) > barrier.odom_sequence
+            )
+        with self._sensor_condition:
+            self.last_consumed_scan_sequence = self.scan_sequence
+            self.last_consumed_odom_sequence = self.odom_sequence
+        return scan, odom
+
     def _validate_continuous_parameters(self) -> None:
         """Validate Round 8 invariants and bounded termination settings."""
         if not math.isclose(
@@ -809,6 +868,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError("no_safe_action_retries must be >= 0")
         if self.dynamic_stop_recovery_limit < 1:
             raise ValueError("dynamic_stop_recovery_limit must be >= 1")
+        if self.local_escape_recovery_limit < 1:
+            raise ValueError("local_escape_recovery_limit must be >= 1")
         if self.drive_sensor_cycle_timeout_sec <= 0.0:
             raise ValueError("drive_sensor_cycle_timeout_sec must be > 0")
         validate_commissioning_config(
@@ -846,6 +907,39 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             start_x=x0,
             start_y=y0,
             step_distance=self.cell_size,
+        )
+
+    def target_for_action_distance(
+        self,
+        action_idx: int,
+        x0: float,
+        y0: float,
+        distance_m: float,
+    ) -> ActionExecutionTarget:
+        """Build an exact-Euclidean-distance target along one DRL direction."""
+        if not math.isfinite(distance_m) or distance_m <= 0.0:
+            raise ValueError("local escape distance must be finite and > 0")
+        direction = self.action_adapter.target_for_action(
+            action_idx,
+            start_x=0.0,
+            start_y=0.0,
+            step_distance=1.0,
+        )
+        direction_norm = math.hypot(direction.odom_dx, direction.odom_dy)
+        odom_dx = direction.odom_dx / direction_norm * distance_m
+        odom_dy = direction.odom_dy / direction_norm * distance_m
+        return ActionExecutionTarget(
+            action_idx=direction.action_idx,
+            action_name=direction.action_name,
+            grid_dr=direction.grid_dr,
+            grid_dc=direction.grid_dc,
+            odom_direction=direction.odom_direction,
+            odom_dx=odom_dx,
+            odom_dy=odom_dy,
+            target_x=x0 + odom_dx,
+            target_y=y0 + odom_dy,
+            target_yaw=direction.target_yaw,
+            target_distance=distance_m,
         )
 
     def pre_motion_footprint_check(
@@ -964,6 +1058,108 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             gate_passed=False,
             safety_fallback_used=False,
         )
+
+    def prepare_local_escape_plan(
+        self,
+        q_ranked: list[tuple[int, float]],
+        scan: LaserScan,
+        odom: Odometry,
+    ) -> LocalEscapePlan:
+        """Select the longest safe deployment-only escape using Q rank."""
+        pose = self.pose_record_from_odom(odom)
+        evaluations: list[dict[str, Any]] = []
+        ranked_actions = sorted(
+            q_ranked,
+            key=lambda item: (-float(item[1]), int(item[0])),
+        )
+        for distance_m in LOCAL_ESCAPE_CANDIDATE_DISTANCES_M:
+            for action_idx, _q_value in ranked_actions:
+                if action_idx not in self.allowed_actions:
+                    continue
+                target = self.target_for_action_distance(
+                    action_idx,
+                    pose["x"],
+                    pose["y"],
+                    distance_m,
+                )
+                check = self.pre_motion_footprint_check(target, pose, scan)
+                evaluations.append(
+                    {
+                        "distance_m": distance_m,
+                        "action_idx": action_idx,
+                        "clearance": check.nearest_capsule_clearance,
+                        "passed": check.passed,
+                        "obstruction_type": check.obstruction_type,
+                    }
+                )
+                if check.passed:
+                    return LocalEscapePlan(
+                        available=True,
+                        action_idx=action_idx,
+                        distance_m=distance_m,
+                        target=target,
+                        pre_motion_pose=pose,
+                        nearest_clearance=check.nearest_capsule_clearance,
+                        candidate_evaluations=evaluations,
+                    )
+        return LocalEscapePlan(
+            available=False,
+            action_idx=None,
+            distance_m=None,
+            target=None,
+            pre_motion_pose=pose,
+            nearest_clearance=None,
+            candidate_evaluations=evaluations,
+        )
+
+    def execute_local_escape(
+        self,
+        plan: LocalEscapePlan,
+        record: dict[str, Any],
+        origin_state: tuple[int, int],
+        consecutive_count: int,
+    ) -> tuple[int, int]:
+        """Execute one selected escape through the complete safety chain."""
+        if plan.target is None or plan.action_idx is None:
+            raise RuntimeError("local escape plan is unavailable")
+        if self.cmd_pub.get_subscription_count() < 1:
+            raise RuntimeError("No /cmd_vel subscriber found")
+        record.update(
+            {
+                "local_escape_attempted": True,
+                "consecutive_local_escape_count": consecutive_count,
+            }
+        )
+        self.experiment_result["local_escape_total_count"] += 1
+        self.experiment_result["local_escape_action_history"].append(
+            plan.action_idx
+        )
+        self._last_dynamic_scan_sequence = self.scan_sequence
+        final_dist = self.execute_target(plan.target)
+        self.stop()
+        try:
+            _post_scan, post_odom = self.refresh_after_local_escape(record)
+        except Exception as exc:
+            record["local_escape_failure_reason"] = f"sensor_failure: {exc}"
+            raise
+        post_pose = self.pose_record_from_odom(post_odom)
+        post_state = self.agent_state_from_odom(
+            origin_state,
+            post_pose["x"],
+            post_pose["y"],
+        )
+        record.update(
+            {
+                "local_escape_success": True,
+                "local_escape_post_pose": post_pose,
+                "local_escape_post_agent_state": list(post_state),
+                "local_escape_final_target_error": final_dist,
+                "actual_grid_state": list(post_state),
+                "grid_transition_match": None,
+            }
+        )
+        self.experiment_result["local_escape_success_total_count"] += 1
+        return post_state
 
     def publish_velocity(self, vx: float = 0.0, wz: float = 0.0) -> None:
         """Enforce the episode wall-clock limit before any non-zero command."""
@@ -1220,6 +1416,22 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "recovery_scan_advanced": False,
                 "recovery_odom_advanced": False,
                 "recovery_refresh_duration_sec": None,
+                "local_escape_attempted": False,
+                "local_escape_available": False,
+                "local_escape_action_idx": None,
+                "local_escape_distance_m": None,
+                "local_escape_pre_motion_clearance": None,
+                "local_escape_success": False,
+                "local_escape_failure_reason": None,
+                "consecutive_local_escape_count": 0,
+                "local_escape_post_pose": None,
+                "local_escape_post_agent_state": None,
+                "local_escape_refresh_scan_advanced": False,
+                "local_escape_refresh_odom_advanced": False,
+                "local_escape_refresh_duration_sec": None,
+                "local_escape_candidate_evaluations": [],
+                "local_escape_target": None,
+                "local_escape_final_target_error": None,
                 "drive_sensor_cycle_timeout_sec": (
                     self.drive_sensor_cycle_timeout_sec
                 ),
@@ -1308,6 +1520,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"{self.experiment_result['dynamic_stop_recovery_total_count']} "
             "dynamic_stop_deadlock="
             f"{self.experiment_result['dynamic_stop_deadlock']} "
+            "local_escape_total_count="
+            f"{self.experiment_result['local_escape_total_count']} "
+            "local_escape_success_total_count="
+            f"{self.experiment_result['local_escape_success_total_count']} "
+            "local_escape_deadlock="
+            f"{self.experiment_result['local_escape_deadlock']} "
             f"termination_reason={exit_reason} "
             f"success={str(success).lower()} "
             f"result_file={result_path or 'not_saved'}"
@@ -1416,6 +1634,30 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"{record['recovery_odom_advanced']} "
             "recovery_refresh_duration_sec="
             f"{format_optional_float(record['recovery_refresh_duration_sec'])} "
+            "local_escape_used="
+            f"{record['local_escape_attempted']} "
+            "local_escape_available="
+            f"{record['local_escape_available']} "
+            "local_escape_action_idx="
+            f"{record['local_escape_action_idx']} "
+            "local_escape_distance_m="
+            f"{format_optional_float(record['local_escape_distance_m'])} "
+            "local_escape_pre_motion_clearance="
+            f"{format_optional_float(record['local_escape_pre_motion_clearance'])} "
+            "local_escape_success="
+            f"{record['local_escape_success']} "
+            "local_escape_failure_reason="
+            f"{record['local_escape_failure_reason']} "
+            "consecutive_local_escape_count="
+            f"{record['consecutive_local_escape_count']} "
+            "local_escape_post_agent_state="
+            f"{record['local_escape_post_agent_state']} "
+            "local_escape_refresh_scan_advanced="
+            f"{record['local_escape_refresh_scan_advanced']} "
+            "local_escape_refresh_odom_advanced="
+            f"{record['local_escape_refresh_odom_advanced']} "
+            "local_escape_refresh_duration_sec="
+            f"{format_optional_float(record['local_escape_refresh_duration_sec'])} "
             "drive_sensor_cycle_count="
             f"{record['drive_sensor_cycle_count']} "
             "drive_sensor_cycle_max_wait_sec="
@@ -1458,6 +1700,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         cum_map = None
         no_safe_action_count = 0
         consecutive_dynamic_stop_count = 0
+        consecutive_local_escape_count = 0
 
         for step_id in range(self.max_steps):
             limit_reason = hard_limit_termination(
@@ -1624,22 +1867,122 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 )
 
                 if not plan.gate_passed or plan.target is None:
+                    if self.commissioning_mode:
+                        self.stop()
+                        self.finish_step_record(
+                            record,
+                            step_started,
+                            False,
+                            "commissioning_action_blocked",
+                        )
+                        self._log_continuous_step(record)
+                        return "commissioning_action_blocked"
+
+                    normal_plan_unavailable = (
+                        not plan.gate_passed
+                        and plan.executed_action is None
+                    )
+                    if (
+                        normal_plan_unavailable
+                        and consecutive_local_escape_count
+                        >= self.local_escape_recovery_limit
+                    ):
+                        self.stop()
+                        record.update(
+                            {
+                                "consecutive_local_escape_count": (
+                                    consecutive_local_escape_count
+                                ),
+                                "local_escape_failure_reason": (
+                                    "local_escape_deadlock"
+                                ),
+                            }
+                        )
+                        self.experiment_result["local_escape_deadlock"] = True
+                        self.finish_step_record(
+                            record,
+                            step_started,
+                            False,
+                            "local_escape_deadlock",
+                        )
+                        self._log_continuous_step(record)
+                        return "local_escape_deadlock"
+
+                    escape_plan: Optional[LocalEscapePlan] = None
+                    if normal_plan_unavailable:
+                        escape_plan = self.prepare_local_escape_plan(
+                            q_ranked,
+                            refreshed_scan,
+                            refreshed_odom,
+                        )
+                        record.update(
+                            {
+                                "local_escape_available": (
+                                    escape_plan.available
+                                ),
+                                "local_escape_action_idx": (
+                                    escape_plan.action_idx
+                                ),
+                                "local_escape_distance_m": (
+                                    escape_plan.distance_m
+                                ),
+                                "local_escape_pre_motion_clearance": (
+                                    escape_plan.nearest_clearance
+                                ),
+                                "local_escape_candidate_evaluations": (
+                                    escape_plan.candidate_evaluations
+                                ),
+                                "consecutive_local_escape_count": (
+                                    consecutive_local_escape_count
+                                ),
+                                "local_escape_target": (
+                                    escape_plan.target.as_dict()
+                                    if escape_plan.target is not None
+                                    else None
+                                ),
+                            }
+                        )
+
+                    if (
+                        escape_plan is not None
+                        and escape_plan.available
+                        and escape_plan.target is not None
+                        and self.execute
+                    ):
+                        consecutive_local_escape_count += 1
+                        post_escape_state = self.execute_local_escape(
+                            escape_plan,
+                            record,
+                            origin_state,
+                            consecutive_local_escape_count,
+                        )
+                        recent_positions.append(post_escape_state)
+                        recent_positions = recent_positions[-8:]
+                        no_safe_action_count = 0
+                        consecutive_dynamic_stop_count = 0
+                        record["consecutive_dynamic_stop_count"] = 0
+                        self.finish_step_record(
+                            record,
+                            step_started,
+                            False,
+                            "no_safe_action_recovered",
+                        )
+                        self._log_continuous_step(record)
+                        continue
+
+                    if escape_plan is not None and escape_plan.available:
+                        record["local_escape_failure_reason"] = (
+                            "execution_disabled"
+                        )
                     self.stop()
                     no_safe_action_count += 1
-                    blocked_reason = (
-                        "commissioning_action_blocked"
-                        if self.commissioning_mode
-                        else "no_safe_action"
-                    )
                     self.finish_step_record(
                         record,
                         step_started,
                         False,
-                        blocked_reason,
+                        "no_safe_action",
                     )
                     self._log_continuous_step(record)
-                    if self.commissioning_mode:
-                        return blocked_reason
                     if no_safe_action_count > self.no_safe_action_retries:
                         return "no_safe_action"
                     self.last_consumed_scan_sequence = self.scan_sequence
@@ -1690,6 +2033,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 recent_positions = recent_positions[-8:]
                 consecutive_dynamic_stop_count = 0
                 record["consecutive_dynamic_stop_count"] = 0
+                consecutive_local_escape_count = 0
+                record["consecutive_local_escape_count"] = 0
                 self.finish_step_record(record, step_started, True, None)
                 self._log_continuous_step(record)
                 successful_termination = successful_step_termination_reason(
@@ -1750,6 +2095,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
 
                 if recovery_error is not None:
                     self.stop(repeat=3)
+                    if record["local_escape_attempted"]:
+                        record["local_escape_failure_reason"] = (
+                            "dynamic_stop_recovery_sensor_failure: "
+                            f"{recovery_error}"
+                        )
                     self.finish_step_record(
                         record,
                         step_started,
@@ -1785,12 +2135,28 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "post_dynamic_stop_pose": post_stop_pose,
                         "post_dynamic_stop_agent_state": list(post_stop_state),
                         "actual_grid_state": list(post_stop_state),
-                        "grid_transition_match": grid_transition_matches(
-                            tuple(record["expected_grid_state"]),
-                            post_stop_state,
+                        "grid_transition_match": (
+                            grid_transition_matches(
+                                tuple(record["expected_grid_state"]),
+                                post_stop_state,
+                            )
+                            if record["expected_grid_state"] is not None
+                            else None
                         ),
                     }
                 )
+                if record["local_escape_attempted"]:
+                    record.update(
+                        {
+                            "local_escape_failure_reason": (
+                                "dynamic_obstacle_stop"
+                            ),
+                            "local_escape_post_pose": post_stop_pose,
+                            "local_escape_post_agent_state": list(
+                                post_stop_state
+                            ),
+                        }
+                    )
                 recent_positions.append(post_stop_state)
                 recent_positions = recent_positions[-8:]
 
@@ -1830,6 +2196,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             except RotationFootprintBlocked as exc:
                 self.stop()
                 record.update(self.sensor_age_diagnostics())
+                if record["local_escape_attempted"]:
+                    record["local_escape_failure_reason"] = (
+                        "rotation_footprint_blocked"
+                    )
                 self.finish_step_record(
                     record,
                     step_started,
@@ -1842,6 +2212,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             except DriveSensorCycleTimeout as exc:
                 self.stop()
                 record.update(self.sensor_age_diagnostics())
+                if record["local_escape_attempted"]:
+                    record["local_escape_failure_reason"] = (
+                        "drive_sensor_cycle_timeout"
+                    )
                 self.finish_step_record(
                     record,
                     step_started,
@@ -1861,6 +2235,13 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 )
                 if str(exc) == "max_runtime_reached":
                     reason = "max_runtime_reached"
+                if (
+                    record["local_escape_attempted"]
+                    and record["local_escape_failure_reason"] is None
+                ):
+                    record["local_escape_failure_reason"] = (
+                        f"{reason}: {exc}"
+                    )
                 self.finish_step_record(
                     record,
                     step_started,

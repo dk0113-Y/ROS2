@@ -23,15 +23,18 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     CONTINUOUS_CELL_SIZE_M,
     CONTINUOUS_DEFAULT_MAX_STEPS,
     DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT,
+    DEFAULT_LOCAL_ESCAPE_RECOVERY_LIMIT,
     DEFAULT_FOOTPRINT_RADIUS_M,
     DEFAULT_LASER_X_IN_BASE_M,
     DEFAULT_LASER_Y_IN_BASE_M,
     DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M,
     DEFAULT_NOMINAL_MIN_CORRIDOR_WIDTH_M,
+    LOCAL_ESCAPE_CANDIDATE_DISTANCES_M,
     ContinuousPreMotionPlan,
     DriveSensorCycleTimeout,
     DynamicObstacleStop,
     FootprintCheck,
+    LocalEscapePlan,
     RealcarPolicyContinuousRunner,
     RotationFootprintBlocked,
     action_source_for_mode,
@@ -169,6 +172,46 @@ class PlanHarness:
         )
         clearance = self.distances[action_idx] - front_edge
         passed = clearance >= 0.0
+        return FootprintCheck(
+            passed,
+            clearance,
+            None if passed else "longitudinal_path_obstruction",
+            1,
+        )
+
+
+class LocalEscapeSelectionHarness:
+    """Evaluate deterministic action-distance safety combinations."""
+
+    def __init__(self, safe_candidates):
+        self.allowed_actions = set(range(8))
+        self.action_adapter = RealcarActionAdapter(
+            ACTIONS_8,
+            ACTION_NAMES,
+            diagonal_mode="grid_center",
+        )
+        self.safe_candidates = set(safe_candidates)
+
+    def pose_record_from_odom(self, odom):
+        """Reuse the production pose conversion."""
+        return RealcarPolicyContinuousRunner.pose_record_from_odom(odom)
+
+    def target_for_action_distance(self, action_idx, x0, y0, distance_m):
+        """Reuse exact-distance production target generation."""
+        return RealcarPolicyContinuousRunner.target_for_action_distance(
+            self,
+            action_idx,
+            x0,
+            y0,
+            distance_m,
+        )
+
+    def pre_motion_footprint_check(self, target, pose, scan):
+        """Return a synthetic capsule result for one exact candidate."""
+        del pose, scan
+        key = (target.action_idx, round(target.target_distance, 2))
+        passed = key in self.safe_candidates
+        clearance = 0.01 if passed else -0.01
         return FootprintCheck(
             passed,
             clearance,
@@ -435,24 +478,51 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         recovery_modes=None,
         dynamic_stop_recovery_limit=3,
         safe_plan=True,
+        escape_plans=None,
+        local_escape_refresh_modes=None,
+        local_escape_displacements=None,
+        local_escape_recovery_limit=3,
+        commissioning_mode=False,
+        execute=True,
+        max_steps=None,
     ):
         self.checkpoint_path = "unused.pt"
-        self.max_steps = max(1, len(motion_outcomes))
+        self.max_steps = max_steps or max(1, len(motion_outcomes))
         self.max_runtime_sec = 60.0
         self.experiment_started_monotonic = time.monotonic()
-        self.commissioning_mode = False
-        self.commissioning_action_idx = -1
-        self.execute = True
+        self.commissioning_mode = commissioning_mode
+        self.commissioning_action_idx = 0 if commissioning_mode else -1
+        self.execute = execute
         self.no_safe_action_retries = 0
         self.dynamic_stop_recovery_limit = dynamic_stop_recovery_limit
+        self.local_escape_recovery_limit = local_escape_recovery_limit
         self.cell_size = CONTINUOUS_CELL_SIZE_M
         self.odom_state_origin = None
         self.motion_outcomes = list(motion_outcomes)
         self.recovery_modes = list(recovery_modes or [])
-        self.safe_plan = safe_plan
+        self.safe_plans = (
+            list(safe_plan)
+            if isinstance(safe_plan, (list, tuple))
+            else None
+        )
+        self.safe_plan = bool(safe_plan) if self.safe_plans is None else True
+        self.escape_plans = list(escape_plans or [])
+        self.local_escape_refresh_modes = list(
+            local_escape_refresh_modes
+            or ["fresh"] * len(self.escape_plans)
+        )
+        self.local_escape_displacements = list(
+            local_escape_displacements or []
+        )
         self.motion_index = 0
         self.recovery_index = 0
         self.recovery_pending = False
+        self.escape_plan_index = 0
+        self.escape_plan_calls = 0
+        self.local_escape_refresh_index = 0
+        self.local_escape_refresh_pending = False
+        self.local_escape_displacement_index = 0
+        self.decision_index = 0
         self.events = []
         self.zero_commands = []
         self.logger = QuietLogger()
@@ -468,12 +538,21 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         self.latest_odom = make_odom()
         self.latest_scan_received_at = time.monotonic()
         self.latest_odom_received_at = time.monotonic()
+        self._sensor_condition = threading.Condition()
+        self.last_consumed_scan_sequence = 0
+        self.last_consumed_odom_sequence = 0
         self._dynamic_step_record = None
+        self.result_write_attempted = False
+        self._episode_travel_distance = 0.0
         self.experiment_result = {
             "steps": [],
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
+            "local_escape_total_count": 0,
+            "local_escape_success_total_count": 0,
+            "local_escape_deadlock": False,
+            "local_escape_action_history": [],
         }
 
     def get_logger(self):
@@ -504,6 +583,23 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
             "recovery_scan_advanced": False,
             "recovery_odom_advanced": False,
             "recovery_refresh_duration_sec": None,
+            "expected_grid_state": None,
+            "local_escape_attempted": False,
+            "local_escape_available": False,
+            "local_escape_action_idx": None,
+            "local_escape_distance_m": None,
+            "local_escape_pre_motion_clearance": None,
+            "local_escape_success": False,
+            "local_escape_failure_reason": None,
+            "consecutive_local_escape_count": 0,
+            "local_escape_post_pose": None,
+            "local_escape_post_agent_state": None,
+            "local_escape_refresh_scan_advanced": False,
+            "local_escape_refresh_odom_advanced": False,
+            "local_escape_refresh_duration_sec": None,
+            "local_escape_candidate_evaluations": [],
+            "local_escape_target": None,
+            "local_escape_final_target_error": None,
         }
         self.experiment_result["steps"].append(record)
         return record, time.monotonic()
@@ -544,6 +640,7 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
     def consume_new_step_inputs(self):
         """Consume the latest coherent pair, including a recovery pair."""
         self.events.append(("consume", self.scan_sequence, self.odom_sequence))
+        self.decision_index += 1
         return self.latest_scan, self.latest_odom
 
     def build_local_snap(self, scan, odom):
@@ -583,6 +680,29 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
             self.recovery_pending = False
             return self.latest_scan, self.latest_odom
 
+        if self.local_escape_refresh_pending:
+            mode = self.local_escape_refresh_modes[
+                self.local_escape_refresh_index
+            ]
+            self.local_escape_refresh_index += 1
+            self.events.append(("local_escape_refresh", mode))
+            if mode in ("fresh", "scan_only", "stale_scan", "stale_odom"):
+                self.scan_sequence += 1
+                self.latest_scan_received_at = time.monotonic()
+            if mode in ("fresh", "odom_only", "stale_scan", "stale_odom"):
+                self.odom_sequence += 1
+                self.latest_odom_received_at = time.monotonic()
+            if mode == "scan_only":
+                raise TimeoutError("post-escape /odom did not advance")
+            if mode == "odom_only":
+                raise TimeoutError("post-escape /scan did not advance")
+            if mode == "stale_scan":
+                raise RuntimeError("/scan timestamp is stale")
+            if mode == "stale_odom":
+                raise RuntimeError("/odom timestamp is stale")
+            self.local_escape_refresh_pending = False
+            return self.latest_scan, self.latest_odom
+
         self.scan_sequence += 1
         self.odom_sequence += 1
         self.latest_scan_received_at = time.monotonic()
@@ -613,6 +733,11 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         """Build a safe fresh target or model the existing no-safe path."""
         del q_ranked, scan, requested_action, allow_fallback
         pose = self.pose_record_from_odom(odom)
+        safe_plan = (
+            self.safe_plans[self.decision_index - 1]
+            if self.safe_plans is not None
+            else self.safe_plan
+        )
         target = self.action_adapter.target_for_action(
             raw_action,
             pose["x"],
@@ -621,22 +746,72 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         )
         return ContinuousPreMotionPlan(
             raw_policy_action=raw_action,
-            executed_action=raw_action if self.safe_plan else None,
-            target=target if self.safe_plan else None,
+            executed_action=raw_action if safe_plan else None,
+            target=target if safe_plan else None,
             pre_motion_pose=pose,
             target_distance=self.cell_size,
             capsule_front_edge=0.60,
             nearest_capsule_clearance=1.0,
-            pre_motion_footprint_passed=self.safe_plan,
-            obstruction_type=None if self.safe_plan else "no_safe_action",
-            gate_passed=self.safe_plan,
+            pre_motion_footprint_passed=safe_plan,
+            obstruction_type=None if safe_plan else "no_safe_action",
+            gate_passed=safe_plan,
             safety_fallback_used=False,
+        )
+
+    def prepare_local_escape_plan(self, q_ranked, scan, odom):
+        """Return a queued bounded escape without policy-history mutation."""
+        del q_ranked, scan
+        self.escape_plan_calls += 1
+        pose = self.pose_record_from_odom(odom)
+        specification = (
+            self.escape_plans[self.escape_plan_index]
+            if self.escape_plan_index < len(self.escape_plans)
+            else None
+        )
+        self.escape_plan_index += 1
+        if specification is None:
+            return LocalEscapePlan(
+                False,
+                None,
+                None,
+                None,
+                pose,
+                None,
+                [],
+            )
+        action_idx, distance_m = specification
+        target = self.target_for_action_distance(
+            action_idx,
+            pose["x"],
+            pose["y"],
+            distance_m,
+        )
+        return LocalEscapePlan(
+            True,
+            action_idx,
+            distance_m,
+            target,
+            pose,
+            0.01,
+            [
+                {
+                    "distance_m": distance_m,
+                    "action_idx": action_idx,
+                    "clearance": 0.01,
+                    "passed": True,
+                    "obstruction_type": None,
+                }
+            ],
         )
 
     def execute_target(self, target: ActionExecutionTarget):
         """Model partial interrupted motion or one completed motion."""
         outcome = self.motion_outcomes[self.motion_index]
         self.motion_index += 1
+        self.events.append(("rotation_check", target.action_idx))
+        if outcome == "rotation_blocked":
+            self.stop(repeat=3)
+            raise RotationFootprintBlocked("rotation_footprint_blocked")
         self.events.append(("execute", target.action_idx, outcome))
         if outcome == "dynamic":
             self.latest_odom = make_odom(x=0.20, y=0.0)
@@ -647,10 +822,29 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
             self.stop(repeat=3)
             self.recovery_pending = True
             raise DynamicObstacleStop("dynamic_footprint_stop")
-        self.latest_odom = make_odom(
-            x=float(self.latest_odom.pose.pose.position.x) + 0.35,
-            y=float(self.latest_odom.pose.pose.position.y),
-        )
+        if self._dynamic_step_record["local_escape_attempted"]:
+            displacement = (
+                self.local_escape_displacements[
+                    self.local_escape_displacement_index
+                ]
+                if self.local_escape_displacement_index
+                < len(self.local_escape_displacements)
+                else target.target_distance
+            )
+            self.local_escape_displacement_index += 1
+            direction_norm = math.hypot(target.odom_dx, target.odom_dy)
+            self.latest_odom = make_odom(
+                x=float(self.latest_odom.pose.pose.position.x)
+                + target.odom_dx / direction_norm * displacement,
+                y=float(self.latest_odom.pose.pose.position.y)
+                + target.odom_dy / direction_norm * displacement,
+            )
+            self.local_escape_refresh_pending = True
+        else:
+            self.latest_odom = make_odom(
+                x=float(self.latest_odom.pose.pose.position.x) + 0.35,
+                y=float(self.latest_odom.pose.pose.position.y),
+            )
         self.scan_sequence += 1
         self.odom_sequence += 1
         return 0.0
@@ -669,6 +863,10 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         """Record only zero commands and their position in the event stream."""
         self.events.append(("stop", repeat))
         self.zero_commands.extend([(0.0, 0.0)] * repeat)
+
+    def save_experiment_result(self):
+        """Avoid filesystem output while exercising episode accounting."""
+        return None
 
 
 def install_continuous_run_dependencies(monkeypatch, harness, actions):
@@ -736,6 +934,11 @@ def test_continuous_loop_has_a_finite_default_step_cap():
 
 def test_dynamic_stop_recovery_limit_defaults_to_three():
     assert DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT == 3
+
+
+def test_local_escape_defaults_are_bounded_and_descending():
+    assert DEFAULT_LOCAL_ESCAPE_RECOVERY_LIMIT == 3
+    assert LOCAL_ESCAPE_CANDIDATE_DISTANCES_M == (0.20, 0.15, 0.10)
 
 
 def test_continuous_sensor_callback_groups_are_independent():
@@ -1576,3 +1779,417 @@ def test_pre_motion_no_safe_action_still_terminates_without_recovery(
     record = harness.experiment_result["steps"][0]
     assert record["failure_reason"] == "no_safe_action"
     assert not record["dynamic_stop_recovered"]
+
+
+@pytest.mark.parametrize("action_idx", (1, 2, 6))
+def test_local_escape_target_has_exact_euclidean_distance(action_idx):
+    harness = LocalEscapeSelectionHarness(set())
+    target = RealcarPolicyContinuousRunner.target_for_action_distance(
+        harness,
+        action_idx,
+        1.0,
+        -2.0,
+        0.20,
+    )
+    assert target.target_distance == pytest.approx(0.20)
+    assert math.hypot(target.odom_dx, target.odom_dy) == pytest.approx(0.20)
+    if action_idx == 1:
+        assert abs(target.odom_dx) == pytest.approx(0.20 / math.sqrt(2.0))
+        assert abs(target.odom_dy) == pytest.approx(0.20 / math.sqrt(2.0))
+
+
+@pytest.mark.parametrize(
+    ("front_distance", "expected_passed"),
+    ((0.449, False), (0.451, True)),
+)
+def test_local_escape_reuses_capsule_geometry_with_045_front_edge(
+    front_distance,
+    expected_passed,
+):
+    harness = ProductionFootprintHarness()
+    harness.action_adapter = RealcarActionAdapter(
+        ACTIONS_8,
+        ACTION_NAMES,
+        "grid_center",
+    )
+    pose = RealcarPolicySafeRunner.pose_record_from_odom(make_odom())
+    target = RealcarPolicyContinuousRunner.target_for_action_distance(
+        harness,
+        2,
+        0.0,
+        0.0,
+        0.20,
+    )
+    result = RealcarPolicyContinuousRunner.pre_motion_footprint_check(
+        harness,
+        target,
+        pose,
+        make_scan_for_base_point(front_distance, 0.0),
+    )
+    assert result.passed is expected_passed
+
+
+def test_local_escape_exact_045_capsule_boundary_is_allowed():
+    result = capsule_footprint_check([(0.450, 0.0)], 0.0, 0.25, 0.20)
+    assert result.passed
+
+
+def test_local_escape_prefers_distance_before_q_rank():
+    harness = LocalEscapeSelectionHarness({(2, 0.10), (6, 0.20)})
+    plan = RealcarPolicyContinuousRunner.prepare_local_escape_plan(
+        harness,
+        [(2, 1.0), (6, 0.5)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert plan.available
+    assert plan.action_idx == 6
+    assert plan.distance_m == pytest.approx(0.20)
+
+
+def test_local_escape_uses_q_rank_at_same_distance():
+    harness = LocalEscapeSelectionHarness({(2, 0.20), (6, 0.20)})
+    plan = RealcarPolicyContinuousRunner.prepare_local_escape_plan(
+        harness,
+        [(2, 1.0), (6, 0.5)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert plan.action_idx == 2
+    assert plan.distance_m == pytest.approx(0.20)
+
+
+def test_local_escape_uses_stable_action_index_for_equal_q():
+    harness = LocalEscapeSelectionHarness({(2, 0.20), (6, 0.20)})
+    plan = RealcarPolicyContinuousRunner.prepare_local_escape_plan(
+        harness,
+        [(6, 1.0), (2, 1.0)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert plan.action_idx == 2
+
+
+@pytest.mark.parametrize(
+    ("safe_candidate", "expected_distance"),
+    (((4, 0.15), 0.15), ((4, 0.10), 0.10)),
+)
+def test_local_escape_falls_back_to_next_bounded_distance(
+    safe_candidate,
+    expected_distance,
+):
+    harness = LocalEscapeSelectionHarness({safe_candidate})
+    plan = RealcarPolicyContinuousRunner.prepare_local_escape_plan(
+        harness,
+        [(4, 1.0)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert plan.action_idx == 4
+    assert plan.distance_m == pytest.approx(expected_distance)
+
+
+def test_local_escape_unavailable_after_all_24_candidates_blocked():
+    harness = LocalEscapeSelectionHarness(set())
+    plan = RealcarPolicyContinuousRunner.prepare_local_escape_plan(
+        harness,
+        [(index, 1.0 - index * 0.01) for index in range(8)],
+        make_scan(1.0),
+        make_odom(),
+    )
+    assert not plan.available
+    assert plan.target is None
+    assert len(plan.candidate_evaluations) == 24
+    assert all(not item["passed"] for item in plan.candidate_evaluations)
+
+
+def test_normal_full_action_prevents_local_escape(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["success"],
+        safe_plan=True,
+        escape_plans=[(6, 0.20)],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [2],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "max_steps_reached"
+    assert model.calls == 1
+    assert harness.escape_plan_calls == 0
+    assert not record["local_escape_attempted"]
+    assert record["executed_action"] == 2
+
+
+def test_local_escape_success_replans_without_policy_history_pollution(
+    monkeypatch,
+):
+    harness = ContinuousRunHarness(
+        ["success", "success"],
+        safe_plan=[False, True],
+        escape_plans=[(6, 0.20)],
+        max_steps=2,
+    )
+    model, adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0, 2],
+    )
+    reason = harness.run()
+    first, second = harness.experiment_result["steps"]
+    assert reason == "max_steps_reached"
+    assert model.calls == 2
+    assert first["executed_action"] is None
+    assert first["pre_motion_executed_action"] is None
+    assert first["local_escape_attempted"]
+    assert first["local_escape_available"]
+    assert first["local_escape_action_idx"] == 6
+    assert first["local_escape_distance_m"] == pytest.approx(0.20)
+    assert first["local_escape_success"]
+    assert not first["step_success"]
+    assert first["failure_reason"] == "no_safe_action_recovered"
+    assert first["local_escape_refresh_scan_advanced"]
+    assert first["local_escape_refresh_odom_advanced"]
+    assert adapter.states == [(60, 60), (60, 59)]
+    assert harness.experiment_result["local_escape_action_history"] == [6]
+    assert harness.experiment_result["executed_action_history"] == [2]
+    assert second["step_success"]
+    harness.finish_experiment(reason)
+    assert harness.experiment_result["successful_steps"] == 1
+    assert harness.experiment_result["travel_distance"] == pytest.approx(0.55)
+
+
+def test_no_safe_short_escape_preserves_no_safe_action_fail_stop(monkeypatch):
+    harness = ContinuousRunHarness(["success"], safe_plan=False)
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "no_safe_action"
+    assert model.calls == 1
+    assert harness.motion_index == 0
+    assert not record["local_escape_available"]
+    assert not record["local_escape_attempted"]
+    assert record["local_escape_candidate_evaluations"] == []
+    assert all(command == (0.0, 0.0) for command in harness.zero_commands)
+
+
+def test_commissioning_blocked_action_never_uses_local_escape(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["success"],
+        safe_plan=False,
+        escape_plans=[(6, 0.20)],
+        commissioning_mode=True,
+    )
+    _model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "commissioning_action_blocked"
+    assert harness.escape_plan_calls == 0
+    assert not record["local_escape_attempted"]
+    assert harness.motion_index == 0
+
+
+@pytest.mark.parametrize(
+    ("refresh_mode", "scan_advanced", "odom_advanced"),
+    (("scan_only", True, False), ("odom_only", False, True)),
+)
+def test_post_escape_refresh_requires_both_sensor_sequences(
+    monkeypatch,
+    refresh_mode,
+    scan_advanced,
+    odom_advanced,
+):
+    harness = ContinuousRunHarness(
+        ["success"],
+        safe_plan=False,
+        escape_plans=[(6, 0.20)],
+        local_escape_refresh_modes=[refresh_mode],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "sensor_failure"
+    assert model.calls == 1
+    assert record["local_escape_refresh_scan_advanced"] is scan_advanced
+    assert record["local_escape_refresh_odom_advanced"] is odom_advanced
+    assert not record["local_escape_success"]
+    assert record["local_escape_failure_reason"].startswith("sensor_failure:")
+
+
+@pytest.mark.parametrize(
+    ("refresh_mode", "sensor_name"),
+    (("stale_scan", "/scan"), ("stale_odom", "/odom")),
+)
+def test_post_escape_stale_sensor_fails_stop(
+    monkeypatch,
+    refresh_mode,
+    sensor_name,
+):
+    harness = ContinuousRunHarness(
+        ["success"],
+        safe_plan=False,
+        escape_plans=[(6, 0.20)],
+        local_escape_refresh_modes=[refresh_mode],
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "sensor_failure"
+    assert model.calls == 1
+    assert sensor_name in record["local_escape_failure_reason"]
+    assert "timestamp is stale" in record["local_escape_failure_reason"]
+
+
+@pytest.mark.parametrize(
+    ("displacement", "expected_state"),
+    ((0.10, (60, 60)), (0.20, (60, 61))),
+)
+def test_post_escape_policy_state_comes_only_from_actual_odom(
+    monkeypatch,
+    displacement,
+    expected_state,
+):
+    harness = ContinuousRunHarness(
+        ["success", "success"],
+        safe_plan=[False, True],
+        escape_plans=[(2, 0.20)],
+        local_escape_displacements=[displacement],
+        max_steps=2,
+    )
+    model, adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0, 2],
+    )
+    reason = harness.run()
+    first = harness.experiment_result["steps"][0]
+    assert reason == "max_steps_reached"
+    assert model.calls == 2
+    assert adapter.states[1] == expected_state
+    assert first["local_escape_post_agent_state"] == list(expected_state)
+
+
+def test_three_escapes_allow_inference_then_block_fourth_attempt(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["success", "success", "success"],
+        safe_plan=[False, False, False, False],
+        escape_plans=[(6, 0.10), (6, 0.10), (6, 0.10)],
+        local_escape_recovery_limit=3,
+        max_steps=4,
+    )
+    model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0, 0, 0, 0],
+    )
+    reason = harness.run()
+    records = harness.experiment_result["steps"]
+    assert reason == "local_escape_deadlock"
+    assert model.calls == 4
+    assert harness.motion_index == 3
+    assert harness.escape_plan_calls == 3
+    assert [record["consecutive_local_escape_count"] for record in records] == [
+        1,
+        2,
+        3,
+        3,
+    ]
+    assert records[2]["local_escape_success"]
+    assert records[3]["failure_reason"] == "local_escape_deadlock"
+    assert harness.experiment_result["local_escape_total_count"] == 3
+    assert harness.experiment_result["local_escape_success_total_count"] == 3
+    assert harness.experiment_result["local_escape_deadlock"]
+
+
+def test_normal_completed_motion_resets_local_escape_count(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["success", "success", "success", "success"],
+        safe_plan=[False, False, True, False],
+        escape_plans=[(6, 0.10), (6, 0.10), (6, 0.10)],
+        max_steps=4,
+    )
+    _model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0, 0, 2, 0],
+    )
+    reason = harness.run()
+    records = harness.experiment_result["steps"]
+    assert reason == "max_steps_reached"
+    assert records[0]["consecutive_local_escape_count"] == 1
+    assert records[1]["consecutive_local_escape_count"] == 2
+    assert records[2]["step_success"]
+    assert records[2]["consecutive_local_escape_count"] == 0
+    assert records[3]["consecutive_local_escape_count"] == 1
+
+
+def test_dynamic_stop_during_escape_abandons_target_and_replans(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["dynamic", "success"],
+        recovery_modes=["fresh"],
+        safe_plan=[False, True],
+        escape_plans=[(6, 0.20)],
+        max_steps=2,
+    )
+    model, adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0, 2],
+    )
+    reason = harness.run()
+    first = harness.experiment_result["steps"][0]
+    execute_events = [event for event in harness.events if event[0] == "execute"]
+    assert reason == "max_steps_reached"
+    assert model.calls == 2
+    assert first["local_escape_attempted"]
+    assert first["consecutive_local_escape_count"] == 1
+    assert first["local_escape_failure_reason"] == "dynamic_obstacle_stop"
+    assert first["dynamic_stop_recovered"]
+    assert first["recovery_scan_advanced"]
+    assert first["recovery_odom_advanced"]
+    assert adapter.states[1] == (60, 61)
+    assert execute_events == [
+        ("execute", 6, "dynamic"),
+        ("execute", 2, "success"),
+    ]
+    assert harness.experiment_result["local_escape_action_history"] == [6]
+    assert harness.experiment_result["executed_action_history"] == [2]
+
+
+def test_rotation_blocked_escape_never_translates(monkeypatch):
+    harness = ContinuousRunHarness(
+        ["rotation_blocked"],
+        safe_plan=False,
+        escape_plans=[(6, 0.20)],
+    )
+    _model, _adapter = install_continuous_run_dependencies(
+        monkeypatch,
+        harness,
+        [0],
+    )
+    reason = harness.run()
+    record = harness.experiment_result["steps"][0]
+    assert reason == "rotation_footprint_blocked"
+    assert ("rotation_check", 6) in harness.events
+    assert not any(event[0] == "execute" for event in harness.events)
+    assert record["local_escape_attempted"]
+    assert not record["local_escape_success"]
+    assert record["actual_distance"] == pytest.approx(0.0)

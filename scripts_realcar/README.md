@@ -281,6 +281,48 @@ scan/odom 和实际 pose，但不再进入下一次 policy decision，最终
 `dynamic_stop_total_count`、`dynamic_stop_recovery_total_count` 和
 `dynamic_stop_deadlock`。
 
+当且仅当 normal-policy 模式已经完成 inference、post-inference fresh scan/odom barrier，
+并确认所有正常完整 DRL action 的 footprint gate 均失败时，continuous runner 可以执行一次
+bounded local escape。它是 deployment-only local recovery primitive，只用于弥合真实连续
+空间与固定离散 motion primitive 之间的局部可执行性缺口；它不是新 DRL action、探索算法、
+frontier/global planner、learned local planner 或第二套导航方法。commissioning forced action
+被阻止时仍直接 `commissioning_action_blocked`，不会调用 escape。正常 cardinal `0.35m` 与
+diagonal grid-center `sqrt(2)*0.35≈0.495m` 语义完全不变。
+
+local escape 只沿现有 8 个 action 方向尝试 exact Euclidean distance
+`[0.20, 0.15, 0.10]m`，严格按距离从大到小、同距离按当前 policy Q rank、Q 相同时按稳定
+action index 选择第一项通过者。diagonal escape 的总平移距离仍是候选值本身，不乘
+`sqrt(2)`。每项继续调用统一的 footprint capsule check，所以 center-line length 分别为
+`0.25/0.20/0.15m`，footprint radius、longitudinal margin 和 comparison tolerance 均不变。
+JSON 最多保留 24 项 `local_escape_candidate_evaluations`；如果连 `0.10m` 都没有安全候选，
+保持零速并沿用 `no_safe_action`，不会尝试更短距离或缩小 footprint。
+
+选中的 escape 仍通过同一个 `execute_target()`，因此 rotation footprint、safe rotate/drive、
+background sensor callbacks、drive-cycle scan+odom watchdog、freshness、dynamic footprint stop、
+subscriber guard、runtime limit 和 zero-command fail-stop 全部生效。完整 escape 后先 stop，再用
+既有 post-motion barrier 等待严格更新且新鲜的 scan 和 odom；真实 post-escape odom 是 grid
+state 和 recent trajectory 的唯一来源。随后从新 observation 更新 cumulative belief，重新
+inference 和正常 safety gate，绝不复用旧 Q/plan。escape 途中 dynamic stop 时继续使用 c006
+的 immediate-stop/fresh-recovery/replan 状态机，旧 escape target 被放弃，同时本次 physical
+attempt 仍计入 local escape 连续保护。
+
+local escape 不写入 `executed_action_history`，其 normal `executed_action` 字段保持 `None`，
+另以 `local_escape_action_idx` 和 `local_escape_distance_m` 审计。即使 escape 完整成功，该
+decision step 仍是 `step_success=false`、`failure_reason=no_safe_action_recovered`，并设置
+`local_escape_success=true`，所以不增加 `successful_steps`；实际 odom displacement 仍通过
+step `actual_distance` 计入 episode `travel_distance`。step 还记录
+`local_escape_attempted`、`local_escape_available`、`local_escape_pre_motion_clearance`、
+`local_escape_failure_reason`、`consecutive_local_escape_count`、post pose/state 及 refresh
+scan/odom advanced/duration。episode 汇总 `local_escape_total_count`、
+`local_escape_success_total_count`、`local_escape_deadlock` 和独立
+`local_escape_action_history`。
+
+`local_escape_recovery_limit=3` 表示最多连续执行三次 physical escape attempt；成功 escape
+本身不清零，escape 中 dynamic-stop interruption 也计一次。第三次完成后仍进入一次新的
+policy inference：若出现正常完整 action，则执行并把计数清零；若所有正常完整 action 仍不
+安全，则不执行第四次 escape，以 `local_escape_deadlock` 结束。该保护与默认仍为 0 的
+`no_safe_action_retries`、以及 `dynamic_stop_recovery_limit=3` 相互独立。
+
 正常完成只有满足最小决策步数、最小 known-area 后的 `frontier_exhausted`。此外还会
 检测 belief stagnation、重复 state 且信息不增长的 deadlock，并以 `max_steps`、
 `max_runtime_sec`、sensor/motion failure、有限 no-safe-action retry 和 operator interrupt
