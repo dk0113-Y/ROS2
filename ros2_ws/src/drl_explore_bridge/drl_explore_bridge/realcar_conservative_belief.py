@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Iterable
+from dataclasses import asdict, dataclass
+from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 
@@ -16,10 +16,196 @@ OBSTACLE = 1
 
 @dataclass(frozen=True)
 class ProjectedBeliefObservation:
-    """A local categorical observation plus exact global obstacle cells."""
+    """A legacy local snapshot plus deduplicated global frame evidence."""
 
     local_snap: np.ndarray
     obstacle_cells: frozenset[tuple[int, int]]
+    free_cells: frozenset[tuple[int, int]] = frozenset()
+    conflict_cells: frozenset[tuple[int, int]] = frozenset()
+
+
+@dataclass(frozen=True)
+class BeliefFusionConfig:
+    """Explicit hysteresis thresholds for deployment evidence fusion."""
+
+    name: str
+    minimum_free_frames: int
+    minimum_obstacle_frames: int
+    free_evidence_margin: int
+    obstacle_evidence_margin: int
+    minimum_free_streak: int = 1
+    minimum_obstacle_streak: int = 1
+
+    def __post_init__(self) -> None:
+        """Reject configurations that cannot provide hysteresis."""
+        if not self.name:
+            raise ValueError("fusion config name must not be empty")
+        if any(
+            not (character.isalnum() or character in "_-")
+            for character in self.name
+        ):
+            raise ValueError(
+                "fusion config name may contain only letters, digits, _ and -"
+            )
+        for field_name in (
+            "minimum_free_frames",
+            "minimum_obstacle_frames",
+            "minimum_free_streak",
+            "minimum_obstacle_streak",
+        ):
+            if int(getattr(self, field_name)) < 1:
+                raise ValueError(f"{field_name} must be >= 1")
+        for field_name in (
+            "free_evidence_margin",
+            "obstacle_evidence_margin",
+        ):
+            if int(getattr(self, field_name)) < 1:
+                raise ValueError(f"{field_name} must be >= 1")
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable configuration record."""
+        return asdict(self)
+
+
+EVIDENCE_FUSION_CANDIDATES: dict[str, BeliefFusionConfig] = {
+    "candidate_a": BeliefFusionConfig(
+        name="candidate_a",
+        minimum_free_frames=2,
+        minimum_obstacle_frames=2,
+        free_evidence_margin=1,
+        obstacle_evidence_margin=1,
+    ),
+    "candidate_b": BeliefFusionConfig(
+        name="candidate_b",
+        minimum_free_frames=2,
+        minimum_obstacle_frames=3,
+        free_evidence_margin=1,
+        obstacle_evidence_margin=2,
+    ),
+    "candidate_c": BeliefFusionConfig(
+        name="candidate_c",
+        minimum_free_frames=2,
+        minimum_obstacle_frames=2,
+        free_evidence_margin=1,
+        obstacle_evidence_margin=1,
+        minimum_free_streak=2,
+        minimum_obstacle_streak=2,
+    ),
+}
+
+
+def named_fusion_config(name: str) -> BeliefFusionConfig:
+    """Return one immutable built-in evidence policy by name."""
+    try:
+        return EVIDENCE_FUSION_CANDIDATES[str(name)]
+    except KeyError as exc:
+        choices = ", ".join(sorted(EVIDENCE_FUSION_CANDIDATES))
+        raise ValueError(
+            f"unknown evidence fusion config {name!r}; choose {choices}"
+        ) from exc
+
+
+@dataclass
+class CellEvidenceState:
+    """Accumulate decision-frame evidence for one global policy cell."""
+
+    free_frame_count: int = 0
+    obstacle_frame_count: int = 0
+    conflict_frame_count: int = 0
+    consecutive_free_frames: int = 0
+    consecutive_obstacle_frames: int = 0
+
+
+@dataclass(frozen=True)
+class MapTransitionStats:
+    """Count categorical transitions applied through deployment hooks."""
+
+    invisible_to_free: int = 0
+    invisible_to_obstacle: int = 0
+    free_to_obstacle: int = 0
+    obstacle_to_free: int = 0
+
+
+@dataclass(frozen=True)
+class FusionStepStats:
+    """Describe one frame of evidence and resulting map transitions."""
+
+    evidence_free_cells_this_step: int
+    evidence_obstacle_cells_this_step: int
+    evidence_conflict_cells_this_step: int
+    invisible_to_free_transitions_this_step: int
+    invisible_to_obstacle_transitions_this_step: int
+    free_to_obstacle_transitions_this_step: int
+    obstacle_to_free_transitions_this_step: int
+
+
+class BeliefEvidenceAccumulator:
+    """Fuse frame-deduplicated global evidence with explicit hysteresis."""
+
+    def __init__(self, config: BeliefFusionConfig):
+        """Create an empty accumulator using one immutable policy."""
+        self.config = config
+        self.cells: dict[tuple[int, int], CellEvidenceState] = {}
+
+    def state_for(self, cell: tuple[int, int]) -> CellEvidenceState:
+        """Return the mutable evidence state for a normalized global cell."""
+        normalized = (int(cell[0]), int(cell[1]))
+        return self.cells.setdefault(normalized, CellEvidenceState())
+
+    def observe(
+        self,
+        free_cells: Iterable[tuple[int, int]],
+        obstacle_cells: Iterable[tuple[int, int]],
+        conflict_cells: Iterable[tuple[int, int]] = (),
+    ) -> frozenset[tuple[int, int]]:
+        """Record one decision frame, counting each cell at most once."""
+        free = {(int(row), int(col)) for row, col in free_cells}
+        obstacle = {
+            (int(row), int(col)) for row, col in obstacle_cells
+        }
+        conflicts = {
+            (int(row), int(col)) for row, col in conflict_cells
+        }
+        conflicts.update(free & obstacle)
+        free.difference_update(conflicts)
+        obstacle.difference_update(conflicts)
+
+        for cell in sorted(free | obstacle | conflicts):
+            state = self.state_for(cell)
+            if cell in conflicts:
+                state.conflict_frame_count += 1
+                state.consecutive_free_frames = 0
+                state.consecutive_obstacle_frames = 0
+            elif cell in free:
+                state.free_frame_count += 1
+                state.consecutive_free_frames += 1
+                state.consecutive_obstacle_frames = 0
+            else:
+                state.obstacle_frame_count += 1
+                state.consecutive_obstacle_frames += 1
+                state.consecutive_free_frames = 0
+        return frozenset(free | obstacle | conflicts)
+
+    def classify(self, cell: tuple[int, int]) -> Optional[int]:
+        """Classify a cell only when one side clears all configured gates."""
+        state = self.state_for(cell)
+        config = self.config
+        free_ready = (
+            state.free_frame_count >= config.minimum_free_frames
+            and state.consecutive_free_frames >= config.minimum_free_streak
+            and state.free_frame_count - state.obstacle_frame_count
+            >= config.free_evidence_margin
+        )
+        obstacle_ready = (
+            state.obstacle_frame_count >= config.minimum_obstacle_frames
+            and state.consecutive_obstacle_frames
+            >= config.minimum_obstacle_streak
+            and state.obstacle_frame_count - state.free_frame_count
+            >= config.obstacle_evidence_margin
+        )
+        if free_ready == obstacle_ready:
+            return None
+        return EMPTY if free_ready else OBSTACLE
 
 
 @dataclass(frozen=True)
@@ -29,6 +215,7 @@ class ObstaclePromotionStats:
     obstacle_promotions_this_step: int
     promoted_from_empty: int
     promoted_from_invisible: int
+    visited_obstacle_to_free: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,7 +269,7 @@ def project_scan_to_belief(
     laser_y_in_base: float,
     laser_yaw_in_base: float,
 ) -> ProjectedBeliefObservation:
-    """Project scan rays through continuous odom and the LiDAR extrinsic."""
+    """Project one scan into legacy categories and global frame evidence."""
     if scan_radius_cells < 1:
         raise ValueError("scan_radius_cells must be >= 1")
 
@@ -94,6 +281,7 @@ def project_scan_to_belief(
         dtype=np.int8,
     )
     local_snap[center, center] = EMPTY
+    free_cells: set[tuple[int, int]] = set()
     obstacle_cells: set[tuple[int, int]] = set()
 
     robot_cos = math.cos(robot_yaw)
@@ -111,7 +299,10 @@ def project_scan_to_belief(
     local_radius_m = int(scan_radius_cells) * float(cell_size)
     sample_step = float(cell_size) / 3.0
 
-    def mark_world(world_x: float, world_y: float, value: int) -> bool:
+    def visible_world_cell(
+        world_x: float,
+        world_y: float,
+    ) -> Optional[tuple[int, int]]:
         world_cell = continuous_world_to_grid(
             world_x,
             world_y,
@@ -123,16 +314,12 @@ def project_scan_to_belief(
         dr = int(world_cell[0]) - int(agent_state[0])
         dc = int(world_cell[1]) - int(agent_state[1])
         if dr * dr + dc * dc > scan_radius_cells * scan_radius_cells:
-            return False
+            return None
         local_row = center + dr
         local_col = center + dc
         if not (0 <= local_row < local_size and 0 <= local_col < local_size):
-            return False
-        if value == OBSTACLE:
-            local_snap[local_row, local_col] = OBSTACLE
-        elif local_snap[local_row, local_col] == INVISIBLE:
-            local_snap[local_row, local_col] = EMPTY
-        return True
+            return None
+        return world_cell
 
     for index, raw_range in enumerate(scan.ranges):
         hit_range = float(raw_range)
@@ -142,8 +329,10 @@ def project_scan_to_belief(
         ):
             continue
 
-        ray_range = hit_range
-        ray_range = min(max(0.0, ray_range), local_radius_m + cell_size)
+        ray_range = min(
+            max(0.0, hit_range),
+            local_radius_m + cell_size,
+        )
         free_end = max(0.0, ray_range - cell_size * 0.25)
         world_yaw = (
             float(robot_yaw)
@@ -154,41 +343,47 @@ def project_scan_to_belief(
         ray_cos = math.cos(world_yaw)
         ray_sin = math.sin(world_yaw)
 
-        distance = 0.0
-        seen_free: set[tuple[int, int]] = set()
-        while distance <= free_end:
-            free_x = laser_origin_x + distance * ray_cos
-            free_y = laser_origin_y + distance * ray_sin
-            free_cell = continuous_world_to_grid(
-                free_x,
-                free_y,
-                origin_x,
-                origin_y,
-                origin_state,
-                cell_size,
-            )
-            if free_cell not in seen_free:
-                seen_free.add(free_cell)
-                mark_world(free_x, free_y, EMPTY)
-            distance += sample_step
-
+        hit_cell: Optional[tuple[int, int]] = None
         if hit_range <= local_radius_m + cell_size:
             hit_x = laser_origin_x + hit_range * ray_cos
             hit_y = laser_origin_y + hit_range * ray_sin
-            hit_cell = continuous_world_to_grid(
-                hit_x,
-                hit_y,
-                origin_x,
-                origin_y,
-                origin_state,
-                cell_size,
-            )
-            if mark_world(hit_x, hit_y, OBSTACLE):
-                obstacle_cells.add(hit_cell)
+            hit_cell = visible_world_cell(hit_x, hit_y)
+
+        distance = 0.0
+        ray_free_cells: set[tuple[int, int]] = set()
+        while distance <= free_end:
+            free_x = laser_origin_x + distance * ray_cos
+            free_y = laser_origin_y + distance * ray_sin
+            free_cell = visible_world_cell(free_x, free_y)
+            if free_cell is not None and free_cell != hit_cell:
+                ray_free_cells.add(free_cell)
+            distance += sample_step
+        free_cells.update(ray_free_cells)
+
+        if hit_cell is not None:
+            obstacle_cells.add(hit_cell)
+
+    conflict_cells = free_cells & obstacle_cells
+
+    # Preserve the exact legacy categorical rule: any endpoint in a coarse
+    # cell dominates free-ray projection in that local snapshot.  Evidence
+    # mode does not consume this categorical snapshot, but legacy A/B replay
+    # and the live legacy default do.
+    for world_row, world_col in sorted(free_cells):
+        local_row = center + int(world_row) - int(agent_state[0])
+        local_col = center + int(world_col) - int(agent_state[1])
+        if local_snap[local_row, local_col] == INVISIBLE:
+            local_snap[local_row, local_col] = EMPTY
+    for world_row, world_col in sorted(obstacle_cells):
+        local_row = center + int(world_row) - int(agent_state[0])
+        local_col = center + int(world_col) - int(agent_state[1])
+        local_snap[local_row, local_col] = OBSTACLE
 
     return ProjectedBeliefObservation(
         local_snap=local_snap,
         obstacle_cells=frozenset(obstacle_cells),
+        free_cells=frozenset(free_cells),
+        conflict_cells=frozenset(conflict_cells),
     )
 
 
@@ -197,12 +392,17 @@ def promote_observed_obstacle_cells(
     obstacle_cells: Iterable[tuple[int, int]],
 ) -> ObstaclePromotionStats:
     """Promote only unvisited cells using the core's cache hooks."""
-    preserve_visited_cells_as_free(cum_map)
+    visited_corrections = preserve_visited_cells_as_free(cum_map)
     unique_cells = sorted(
         {(int(row), int(col)) for row, col in obstacle_cells}
     )
     if not unique_cells:
-        return ObstaclePromotionStats(0, 0, 0)
+        return ObstaclePromotionStats(
+            0,
+            0,
+            0,
+            visited_corrections.corrected_from_obstacle,
+        )
 
     world_rows = np.asarray([cell[0] for cell in unique_cells], dtype=np.int32)
     world_cols = np.asarray([cell[1] for cell in unique_cells], dtype=np.int32)
@@ -255,7 +455,189 @@ def promote_observed_obstacle_cells(
         promoted_count,
         promoted_from_empty,
         promoted_from_invisible,
+        visited_corrections.corrected_from_obstacle,
     )
+
+
+def visited_only_local_snap(local_shape: tuple[int, int]) -> np.ndarray:
+    """Build a core-compatible snapshot containing only robot occupancy."""
+    if len(local_shape) != 2 or min(int(value) for value in local_shape) < 1:
+        raise ValueError("local_shape must contain two positive dimensions")
+    snap = np.full(
+        tuple(int(value) for value in local_shape),
+        INVISIBLE,
+        dtype=np.int8,
+    )
+    snap[snap.shape[0] // 2, snap.shape[1] // 2] = EMPTY
+    return snap
+
+
+def apply_world_categorical_transitions(
+    cum_map: Any,
+    desired_values: Mapping[tuple[int, int], int],
+) -> MapTransitionStats:
+    """Apply deployment transitions while refreshing every core cache hook."""
+    normalized = {
+        (int(cell[0]), int(cell[1])): int(value)
+        for cell, value in desired_values.items()
+    }
+    invalid_values = set(normalized.values()) - {EMPTY, OBSTACLE}
+    if invalid_values:
+        raise ValueError(
+            "categorical transitions require FREE/OBSTACLE, got "
+            f"{invalid_values}"
+        )
+    if not normalized:
+        return MapTransitionStats()
+
+    cells = sorted(normalized)
+    world_rows = np.asarray([cell[0] for cell in cells], dtype=np.int32)
+    world_cols = np.asarray([cell[1] for cell in cells], dtype=np.int32)
+    targets = np.asarray([normalized[cell] for cell in cells], dtype=np.int8)
+    expansion = cum_map._ensure_world_bounds(
+        int(world_rows.min()),
+        int(world_rows.max()),
+        int(world_cols.min()),
+        int(world_cols.max()),
+    )
+    dirty_rects: list[Any] = []
+    if expansion is not None:
+        dirty_rects.extend(expansion.seam_dirty_rects)
+
+    array_rows = world_rows - int(cum_map.origin_world_rc[0])
+    array_cols = world_cols - int(cum_map.origin_world_rc[1])
+    previous = np.asarray(cum_map.map[array_rows, array_cols]).copy()
+    visited = np.asarray(
+        cum_map.visit_count[array_rows, array_cols] > 0,
+        dtype=bool,
+    )
+    targets[visited] = EMPTY
+    changed = previous != targets
+
+    invisible_to_free = int(
+        np.count_nonzero(
+            changed & (previous == INVISIBLE) & (targets == EMPTY)
+        )
+    )
+    invisible_to_obstacle = int(
+        np.count_nonzero(
+            changed & (previous == INVISIBLE) & (targets == OBSTACLE)
+        )
+    )
+    free_to_obstacle = int(
+        np.count_nonzero(changed & (previous == EMPTY) & (targets == OBSTACLE))
+    )
+    obstacle_to_free = int(
+        np.count_nonzero(changed & (previous == OBSTACLE) & (targets == EMPTY))
+    )
+
+    if np.any(changed):
+        changed_rows = array_rows[changed]
+        changed_cols = array_cols[changed]
+        cum_map.map[changed_rows, changed_cols] = targets[changed]
+        newly_known = changed & (previous == INVISIBLE)
+        if np.any(newly_known):
+            cum_map.kpm_count += cum_map._count_coverage_hits(
+                world_rows[newly_known],
+                world_cols[newly_known],
+            )
+        cum_map._invalidate_map_state_caches()
+        dirty = cum_map._dirty_rect_from_points(changed_rows, changed_cols)
+        dirty = cum_map._expand_dirty_rect(dirty, radius=1)
+        if dirty is not None:
+            dirty_rects.append(dirty)
+
+    cum_map._update_frontier_dirty_rects(dirty_rects)
+    cum_map._refresh_coverage()
+    cum_map._update_analysis_box()
+    return MapTransitionStats(
+        invisible_to_free=invisible_to_free,
+        invisible_to_obstacle=invisible_to_obstacle,
+        free_to_obstacle=free_to_obstacle,
+        obstacle_to_free=obstacle_to_free,
+    )
+
+
+def apply_evidence_fusion(
+    cum_map: Any,
+    accumulator: BeliefEvidenceAccumulator,
+    observation: ProjectedBeliefObservation,
+) -> FusionStepStats:
+    """Fuse one projected decision frame into the cumulative belief."""
+    visited_corrections = preserve_visited_cells_as_free(cum_map)
+    touched = accumulator.observe(
+        observation.free_cells,
+        observation.obstacle_cells,
+        observation.conflict_cells,
+    )
+    conflicts = set(observation.conflict_cells)
+    conflicts.update(
+        set(observation.free_cells) & set(observation.obstacle_cells)
+    )
+    desired: dict[tuple[int, int], int] = {}
+    for cell in sorted(touched):
+        if cell in conflicts:
+            continue
+        classification = accumulator.classify(cell)
+        if classification is not None:
+            desired[cell] = classification
+    transitions = apply_world_categorical_transitions(cum_map, desired)
+    return FusionStepStats(
+        evidence_free_cells_this_step=len(observation.free_cells),
+        evidence_obstacle_cells_this_step=len(observation.obstacle_cells),
+        evidence_conflict_cells_this_step=len(conflicts),
+        invisible_to_free_transitions_this_step=(
+            transitions.invisible_to_free
+        ),
+        invisible_to_obstacle_transitions_this_step=(
+            transitions.invisible_to_obstacle
+        ),
+        free_to_obstacle_transitions_this_step=(
+            transitions.free_to_obstacle
+        ),
+        obstacle_to_free_transitions_this_step=(
+            transitions.obstacle_to_free
+            + visited_corrections.corrected_from_obstacle
+        ),
+    )
+
+
+def apply_legacy_fusion(
+    cum_map: Any,
+    observation: ProjectedBeliefObservation,
+) -> FusionStepStats:
+    """Apply the pre-evidence one-endpoint promotion behavior explicitly."""
+    promotion = promote_observed_obstacle_cells(
+        cum_map,
+        observation.obstacle_cells,
+    )
+    conflicts = set(observation.conflict_cells)
+    conflicts.update(
+        set(observation.free_cells) & set(observation.obstacle_cells)
+    )
+    return FusionStepStats(
+        evidence_free_cells_this_step=len(observation.free_cells),
+        evidence_obstacle_cells_this_step=len(observation.obstacle_cells),
+        evidence_conflict_cells_this_step=len(conflicts),
+        invisible_to_free_transitions_this_step=0,
+        invisible_to_obstacle_transitions_this_step=(
+            promotion.promoted_from_invisible
+        ),
+        free_to_obstacle_transitions_this_step=promotion.promoted_from_empty,
+        obstacle_to_free_transitions_this_step=(
+            promotion.visited_obstacle_to_free
+        ),
+    )
+
+
+def final_belief_cell_counts(cum_map: Any) -> dict[str, int]:
+    """Count final categorical map cells without mutating belief state."""
+    belief = np.asarray(cum_map.map)
+    return {
+        "final_free_cells": int(np.count_nonzero(belief == EMPTY)),
+        "final_obstacle_cells": int(np.count_nonzero(belief == OBSTACLE)),
+        "final_unknown_cells": int(np.count_nonzero(belief == INVISIBLE)),
+    }
 
 
 def _apply_visited_free_corrections(

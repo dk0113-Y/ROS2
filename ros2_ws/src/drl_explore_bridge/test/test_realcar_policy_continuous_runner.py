@@ -17,7 +17,9 @@ from drl_explore_bridge.realcar_action_adapter import (
     RealcarActionAdapter,
 )
 from drl_explore_bridge.realcar_conservative_belief import (
+    BeliefEvidenceAccumulator,
     ProjectedBeliefObservation,
+    named_fusion_config,
 )
 from drl_explore_bridge import (
     realcar_policy_continuous_runner_node as continuous_runner_module,
@@ -500,6 +502,11 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         self.commissioning_mode = commissioning_mode
         self.commissioning_action_idx = 0 if commissioning_mode else -1
         self.execute = execute
+        self.fusion_mode = "legacy"
+        self.fusion_config = named_fusion_config("candidate_a")
+        self._belief_evidence = BeliefEvidenceAccumulator(
+            self.fusion_config
+        )
         self.no_safe_action_retries = 0
         self.dynamic_stop_recovery_limit = dynamic_stop_recovery_limit
         self.local_escape_recovery_limit = local_escape_recovery_limit
@@ -557,6 +564,11 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
             "obstacle_promotions_total": 0,
+            "evidence_free_cells_total": 0,
+            "evidence_obstacle_cells_total": 0,
+            "evidence_conflict_cells_total": 0,
+            "free_to_obstacle_transitions_total": 0,
+            "obstacle_to_free_transitions_total": 0,
             "local_escape_total_count": 0,
             "local_escape_success_total_count": 0,
             "local_escape_deadlock": False,

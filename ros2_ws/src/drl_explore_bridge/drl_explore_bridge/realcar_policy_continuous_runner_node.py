@@ -25,11 +25,16 @@ from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
 from drl_explore_bridge.realcar_conservative_belief import (
+    BeliefEvidenceAccumulator,
     OBSTACLE,
     ProjectedBeliefObservation,
+    apply_evidence_fusion,
+    apply_legacy_fusion,
+    final_belief_cell_counts,
+    named_fusion_config,
     project_scan_to_belief,
-    promote_observed_obstacle_cells,
     record_traversed_cells_as_free,
+    visited_only_local_snap,
 )
 from drl_explore_bridge.realcar_policy_safe_runner_node import (
     ACTIONS_8,
@@ -41,6 +46,7 @@ from drl_explore_bridge.realcar_policy_safe_runner_node import (
     norm_angle,
     odom_delta_to_grid_offset,
     sensor_sample_is_after_barrier,
+    stamp_to_sec,
 )
 
 
@@ -623,6 +629,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
     SEPARATE_SENSOR_CALLBACK_GROUPS = True
 
     def __init__(self) -> None:
+        """Initialize guarded motion, fusion, and episode diagnostics."""
         self._sensor_condition = threading.Condition()
         super().__init__()
 
@@ -678,6 +685,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "disable_completion_termination_in_dryrun",
             True,
         )
+        self.declare_parameter("belief_fusion_mode", "legacy")
+        self.declare_parameter("belief_fusion_config", "candidate_a")
 
         self.max_runtime_sec = float(
             self.get_parameter("max_runtime_sec").value
@@ -750,12 +759,21 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "disable_completion_termination_in_dryrun"
             ).value
         )
+        self.fusion_mode = str(
+            self.get_parameter("belief_fusion_mode").value
+        ).strip().lower()
+        self.fusion_config = named_fusion_config(
+            str(self.get_parameter("belief_fusion_config").value).strip()
+        )
 
         self._validate_continuous_parameters()
         self._last_dynamic_scan_sequence = self.scan_sequence
         self._dynamic_step_record: Optional[dict[str, Any]] = None
         self._episode_travel_distance = 0.0
         self._final_cum_map: Optional[Any] = None
+        self._belief_evidence = BeliefEvidenceAccumulator(
+            self.fusion_config
+        )
 
         started_at = datetime.now().astimezone()
         repo_root = Path(__file__).resolve().parents[4]
@@ -768,6 +786,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "checkpoint_path": self.checkpoint_path,
             "execute": self.execute,
             "cell_size": self.cell_size,
+            "origin_state": list(CONTINUOUS_ORIGIN_STATE),
+            "scan_radius_cells": self.scan_radius_cells,
             "step_distance": self.step_distance,
             "diagonal_mode": self.diagonal_mode,
             "max_steps": self.max_steps,
@@ -777,6 +797,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "action_source": action_source_for_mode(
                 self.commissioning_mode
             ),
+            "fusion_mode": self.fusion_mode,
+            "fusion_config": self.fusion_config.as_dict(),
             "termination_parameters": {
                 "minimum_completion_decision_steps": (
                     self.minimum_completion_decision_steps
@@ -818,6 +840,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             ),
             "laser_x_in_base_m": self.laser_x_in_base_m,
             "laser_y_in_base_m": self.laser_y_in_base_m,
+            "laser_yaw_in_base": self.laser_yaw_in_base,
             "drive_sensor_cycle_timeout_sec": (
                 self.drive_sensor_cycle_timeout_sec
             ),
@@ -836,12 +859,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "final_trajectory_cell_count": 0,
             "final_trajectory_obstacle_count": 0,
             "final_trajectory_obstacle_ratio": 0.0,
+            "final_free_cells": 0,
+            "final_obstacle_cells": 0,
+            "final_unknown_cells": 0,
             "safety_fallback_total_count": 0,
             "safety_fallback_rate": 0.0,
             "dynamic_stop_total_count": 0,
             "dynamic_stop_recovery_total_count": 0,
             "dynamic_stop_deadlock": False,
             "obstacle_promotions_total": 0,
+            "evidence_free_cells_total": 0,
+            "evidence_obstacle_cells_total": 0,
+            "evidence_conflict_cells_total": 0,
+            "free_to_obstacle_transitions_total": 0,
+            "obstacle_to_free_transitions_total": 0,
             "local_escape_total_count": 0,
             "local_escape_success_total_count": 0,
             "local_escape_deadlock": False,
@@ -880,6 +911,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"commissioning_mode={self.commissioning_mode} "
             f"commissioning_action_idx={self.commissioning_action_idx} "
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
+            f"fusion_mode={self.fusion_mode} "
+            f"fusion_config={self.fusion_config.name} "
             "sensor_executor=background_multithreaded "
             "sensor_callback_groups=independent "
             "completion_source=belief_only"
@@ -1045,6 +1078,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
 
     def _validate_continuous_parameters(self) -> None:
         """Validate Round 8 invariants and bounded termination settings."""
+        if getattr(self, "fusion_mode", "legacy") not in (
+            "legacy",
+            "evidence",
+        ):
+            raise ValueError("belief_fusion_mode must be 'legacy' or 'evidence'")
         if not math.isclose(
             self.cell_size,
             CONTINUOUS_CELL_SIZE_M,
@@ -1659,9 +1697,23 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 .astimezone()
                 .isoformat(timespec="milliseconds"),
                 "agent_state": None,
+                "observation_scan_timestamp": None,
                 "known_cells": None,
                 "known_cells_delta": None,
                 "frontier_count": None,
+                "fusion_mode": self.fusion_mode,
+                "fusion_config": self.fusion_config.as_dict(),
+                "evidence_free_cells_this_step": 0,
+                "evidence_obstacle_cells_this_step": 0,
+                "evidence_conflict_cells_this_step": 0,
+                "free_to_obstacle_transitions_this_step": 0,
+                "obstacle_to_free_transitions_this_step": 0,
+                "free_to_obstacle_transitions_total": self.experiment_result[
+                    "free_to_obstacle_transitions_total"
+                ],
+                "obstacle_to_free_transitions_total": self.experiment_result[
+                    "obstacle_to_free_transitions_total"
+                ],
                 "obstacle_promotions_this_step": 0,
                 "obstacle_promotions_total": self.experiment_result[
                     "obstacle_promotions_total"
@@ -1807,7 +1859,16 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 )
             final_cum_map = getattr(self, "_final_cum_map", None)
             if final_cum_map is not None:
-                record_traversed_cells_as_free(final_cum_map, trajectory)
+                final_corrections = record_traversed_cells_as_free(
+                    final_cum_map,
+                    trajectory,
+                )
+                self.experiment_result[
+                    "obstacle_to_free_transitions_total"
+                ] += final_corrections.corrected_from_obstacle
+                self.experiment_result.update(
+                    final_belief_cell_counts(final_cum_map)
+                )
                 self.experiment_result.update(
                     final_trajectory_belief_diagnostics(
                         final_cum_map,
@@ -1921,6 +1982,16 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"known_cells={record['known_cells']} "
             f"known_cells_delta={record['known_cells_delta']} "
             f"frontier_count={record['frontier_count']} "
+            "evidence_free_cells_this_step="
+            f"{record['evidence_free_cells_this_step']} "
+            "evidence_obstacle_cells_this_step="
+            f"{record['evidence_obstacle_cells_this_step']} "
+            "evidence_conflict_cells_this_step="
+            f"{record['evidence_conflict_cells_this_step']} "
+            "free_to_obstacle_transitions_this_step="
+            f"{record['free_to_obstacle_transitions_this_step']} "
+            "obstacle_to_free_transitions_this_step="
+            f"{record['obstacle_to_free_transitions_this_step']} "
             "obstacle_promotions_this_step="
             f"{record['obstacle_promotions_this_step']} "
             "obstacle_promotions_total="
@@ -2049,6 +2120,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 scan, odom = self.consume_new_step_inputs()
                 observation_pose = self.pose_record_from_odom(odom)
                 record["observation_pose"] = observation_pose
+                record["observation_scan_timestamp"] = stamp_to_sec(
+                    scan.header.stamp
+                )
                 if self.odom_state_origin is None:
                     self.odom_state_origin = (
                         observation_pose["x"],
@@ -2069,22 +2143,53 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     agent_state,
                 )
                 snap = observation.local_snap
+                core_snap = (
+                    snap
+                    if self.fusion_mode == "legacy"
+                    else visited_only_local_snap(tuple(snap.shape))
+                )
                 if cum_map is None:
                     cum_map = CumulativeBeliefMap(
                         compatibility_true_grid,
                         agent_state,
-                        snap,
+                        core_snap,
                     )
                 else:
-                    cum_map.update(agent_state, snap)
+                    cum_map.update(agent_state, core_snap)
                 self._final_cum_map = cum_map
-                promotion_stats = promote_observed_obstacle_cells(
-                    cum_map,
-                    observation.obstacle_cells,
+                fusion_stats = (
+                    apply_legacy_fusion(cum_map, observation)
+                    if self.fusion_mode == "legacy"
+                    else apply_evidence_fusion(
+                        cum_map,
+                        self._belief_evidence,
+                        observation,
+                    )
+                )
+                obstacle_promotions_this_step = (
+                    fusion_stats.invisible_to_obstacle_transitions_this_step
+                    + fusion_stats.free_to_obstacle_transitions_this_step
                 )
                 self.experiment_result["obstacle_promotions_total"] += (
-                    promotion_stats.obstacle_promotions_this_step
+                    obstacle_promotions_this_step
                 )
+                for key in (
+                    "evidence_free_cells",
+                    "evidence_obstacle_cells",
+                    "evidence_conflict_cells",
+                ):
+                    self.experiment_result[f"{key}_total"] += getattr(
+                        fusion_stats,
+                        f"{key}_this_step",
+                    )
+                for key in (
+                    "free_to_obstacle_transitions",
+                    "obstacle_to_free_transitions",
+                ):
+                    self.experiment_result[f"{key}_total"] += getattr(
+                        fusion_stats,
+                        f"{key}_this_step",
+                    )
                 known_cells, frontier_count = belief_statistics(cum_map)
                 known_delta = (
                     known_cells if not known_history
@@ -2095,8 +2200,33 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "known_cells": known_cells,
                         "known_cells_delta": known_delta,
                         "frontier_count": frontier_count,
+                        "evidence_free_cells_this_step": (
+                            fusion_stats.evidence_free_cells_this_step
+                        ),
+                        "evidence_obstacle_cells_this_step": (
+                            fusion_stats.evidence_obstacle_cells_this_step
+                        ),
+                        "evidence_conflict_cells_this_step": (
+                            fusion_stats.evidence_conflict_cells_this_step
+                        ),
+                        "free_to_obstacle_transitions_this_step": (
+                            fusion_stats.free_to_obstacle_transitions_this_step
+                        ),
+                        "obstacle_to_free_transitions_this_step": (
+                            fusion_stats.obstacle_to_free_transitions_this_step
+                        ),
+                        "free_to_obstacle_transitions_total": (
+                            self.experiment_result[
+                                "free_to_obstacle_transitions_total"
+                            ]
+                        ),
+                        "obstacle_to_free_transitions_total": (
+                            self.experiment_result[
+                                "obstacle_to_free_transitions_total"
+                            ]
+                        ),
                         "obstacle_promotions_this_step": (
-                            promotion_stats.obstacle_promotions_this_step
+                            obstacle_promotions_this_step
                         ),
                         "obstacle_promotions_total": self.experiment_result[
                             "obstacle_promotions_total"

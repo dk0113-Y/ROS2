@@ -7,9 +7,15 @@ import pytest
 from sensor_msgs.msg import LaserScan
 
 from drl_explore_bridge.realcar_conservative_belief import (
+    BeliefEvidenceAccumulator,
+    BeliefFusionConfig,
     EMPTY,
     INVISIBLE,
     OBSTACLE,
+    ProjectedBeliefObservation,
+    apply_evidence_fusion,
+    apply_legacy_fusion,
+    named_fusion_config,
     project_scan_to_belief,
     promote_observed_obstacle_cells,
     record_traversed_cells_as_free,
@@ -171,7 +177,9 @@ def test_invalid_ray_does_not_create_a_free_corridor(distance):
     expected = np.full((21, 21), INVISIBLE, dtype=np.int8)
     expected[10, 10] = EMPTY
     np.testing.assert_array_equal(observation.local_snap, expected)
+    assert observation.free_cells == frozenset()
     assert observation.obstacle_cells == frozenset()
+    assert observation.conflict_cells == frozenset()
 
 
 def test_valid_obstacle_ray_clears_only_cells_before_endpoint():
@@ -183,6 +191,9 @@ def test_valid_obstacle_ray_clears_only_cells_before_endpoint():
         np.full(3, EMPTY, dtype=np.int8),
     )
     assert observation.local_snap[10, 13] == OBSTACLE
+    assert observation.free_cells == frozenset(
+        {(60, 60), (60, 61), (60, 62)}
+    )
     assert observation.obstacle_cells == frozenset({(60, 63)})
 
 
@@ -340,3 +351,245 @@ def test_obstacle_to_visited_free_refreshes_frontier_and_caches():
     assert belief.visit_cache_invalidated
     assert belief.coverage_refreshed
     assert belief.analysis_refreshed
+
+
+def test_frame_conflict_is_explicit_and_ray_order_independent():
+    """Cross-ray FREE/endpoint overlap remains an explicit ambiguity."""
+    forward = project(
+        make_multi_scan([0.50, 0.08], angle_increment=0.0),
+        laser_x=0.0,
+    )
+    reversed_order = project(
+        make_multi_scan([0.08, 0.50], angle_increment=0.0),
+        laser_x=0.0,
+    )
+
+    assert ORIGIN_STATE in forward.free_cells
+    assert ORIGIN_STATE in forward.obstacle_cells
+    assert forward.conflict_cells == frozenset({ORIGIN_STATE})
+    assert reversed_order.free_cells == forward.free_cells
+    assert reversed_order.obstacle_cells == forward.obstacle_cells
+    assert reversed_order.conflict_cells == forward.conflict_cells
+    np.testing.assert_array_equal(
+        reversed_order.local_snap,
+        forward.local_snap,
+    )
+
+
+def test_same_ray_endpoint_cell_is_not_counted_as_free_evidence():
+    """Coarse quantization cannot make one ray vote both ways."""
+    observation = project(make_scan(0.08), laser_x=0.0)
+
+    assert observation.free_cells == frozenset()
+    assert observation.obstacle_cells == frozenset({ORIGIN_STATE})
+    assert observation.conflict_cells == frozenset()
+
+
+def test_many_free_rays_count_as_one_free_frame():
+    """Raw beam multiplicity does not amplify free evidence."""
+    observation = project(
+        make_multi_scan([1.0] * 100, angle_increment=0.0),
+        laser_x=0.0,
+    )
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+
+    accumulator.observe(
+        observation.free_cells,
+        observation.obstacle_cells,
+        observation.conflict_cells,
+    )
+
+    assert accumulator.state_for(ORIGIN_STATE).free_frame_count == 1
+
+
+def test_many_obstacle_endpoints_count_as_one_obstacle_frame():
+    """Raw endpoint multiplicity does not amplify obstacle evidence."""
+    observation = project(
+        make_multi_scan([1.0] * 100, angle_increment=0.0),
+        laser_x=0.0,
+    )
+    endpoint = (60, 63)
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+
+    accumulator.observe(
+        observation.free_cells,
+        observation.obstacle_cells,
+        observation.conflict_cells,
+    )
+
+    assert accumulator.state_for(endpoint).obstacle_frame_count == 1
+
+
+def evidence_observation(*, free=(), obstacle=(), conflict=()):
+    """Build one synthetic global evidence frame."""
+    return ProjectedBeliefObservation(
+        local_snap=np.full((3, 3), INVISIBLE, dtype=np.int8),
+        obstacle_cells=frozenset(obstacle),
+        free_cells=frozenset(free),
+        conflict_cells=frozenset(conflict),
+    )
+
+
+def test_single_obstacle_frame_does_not_poison_coarse_cell():
+    """One endpoint cannot change a free cell under candidate evidence mode."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+
+    stats = apply_evidence_fusion(
+        belief,
+        accumulator,
+        evidence_observation(obstacle={ORIGIN_STATE}),
+    )
+
+    assert belief.map[2, 2] == EMPTY
+    assert stats.free_to_obstacle_transitions_this_step == 0
+
+
+def test_repeated_obstacle_frames_can_classify_unvisited_cell():
+    """Configured endpoint support can transition FREE to OBSTACLE."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    frame = evidence_observation(obstacle={ORIGIN_STATE})
+
+    apply_evidence_fusion(belief, accumulator, frame)
+    stats = apply_evidence_fusion(belief, accumulator, frame)
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert stats.free_to_obstacle_transitions_this_step == 1
+
+
+def test_repeated_free_frames_reclassify_unvisited_obstacle():
+    """Sustained free evidence reverses an earlier obstacle classification."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    obstacle = evidence_observation(obstacle={ORIGIN_STATE})
+    free = evidence_observation(free={ORIGIN_STATE})
+    apply_evidence_fusion(belief, accumulator, obstacle)
+    apply_evidence_fusion(belief, accumulator, obstacle)
+
+    for _index in range(3):
+        stats = apply_evidence_fusion(belief, accumulator, free)
+
+    assert belief.map[2, 2] == EMPTY
+    assert stats.obstacle_to_free_transitions_this_step == 1
+
+
+def test_supported_obstacle_is_not_erased_by_one_free_frame():
+    """One isolated free frame cannot erase a supported obstacle."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    obstacle = evidence_observation(obstacle={ORIGIN_STATE})
+    apply_evidence_fusion(belief, accumulator, obstacle)
+    apply_evidence_fusion(belief, accumulator, obstacle)
+
+    stats = apply_evidence_fusion(
+        belief,
+        accumulator,
+        evidence_observation(free={ORIGIN_STATE}),
+    )
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert stats.obstacle_to_free_transitions_this_step == 0
+
+
+def test_evidence_endpoint_cannot_change_visited_cell():
+    """Visited FREE remains authoritative after supported endpoints."""
+    belief = BeliefCacheHarness()
+    belief.visit_count[2, 2] = 1
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    frame = evidence_observation(obstacle={ORIGIN_STATE})
+
+    for _index in range(5):
+        apply_evidence_fusion(belief, accumulator, frame)
+
+    assert belief.map[2, 2] == EMPTY
+
+
+def test_evidence_obstacle_to_free_refreshes_frontier_and_caches():
+    """Evidence reversal restores frontier and invalidates obstacle caches."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    obstacle = evidence_observation(obstacle={ORIGIN_STATE})
+    free = evidence_observation(free={ORIGIN_STATE})
+    apply_evidence_fusion(belief, accumulator, obstacle)
+    apply_evidence_fusion(belief, accumulator, obstacle)
+    belief._cached_obstacle_integral = np.ones((2, 2), dtype=np.int64)
+    belief._latest_frontier_stats = object()
+
+    for _index in range(3):
+        apply_evidence_fusion(belief, accumulator, free)
+
+    assert belief.map[2, 2] == EMPTY
+    assert belief.get_frontier_u8()[2, 2] == 255
+    assert belief._cached_obstacle_integral is None
+    assert belief._latest_frontier_stats is None
+
+
+def test_evidence_free_to_obstacle_refreshes_frontier_and_caches():
+    """Supported endpoints remove stale frontier state."""
+    belief = BeliefCacheHarness()
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    frame = evidence_observation(obstacle={ORIGIN_STATE})
+
+    apply_evidence_fusion(belief, accumulator, frame)
+    apply_evidence_fusion(belief, accumulator, frame)
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert belief.get_frontier_u8()[2, 2] == 0
+    assert belief._cached_obstacle_integral is None
+    assert belief._latest_frontier_stats is None
+
+
+def test_legacy_mode_preserves_one_frame_obstacle_promotion():
+    """Explicit legacy fusion retains the original one-endpoint behavior."""
+    belief = BeliefCacheHarness()
+    stats = apply_legacy_fusion(
+        belief,
+        evidence_observation(obstacle={ORIGIN_STATE}),
+    )
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert stats.free_to_obstacle_transitions_this_step == 1
+
+
+def test_candidate_fusion_is_independent_of_cell_iteration_order():
+    """Set/list iteration order cannot change counts or classifications."""
+    config = BeliefFusionConfig(
+        name="order_test",
+        minimum_free_frames=1,
+        minimum_obstacle_frames=1,
+        free_evidence_margin=1,
+        obstacle_evidence_margin=1,
+    )
+    first = BeliefEvidenceAccumulator(config)
+    second = BeliefEvidenceAccumulator(config)
+    free = [(60, 60), (60, 61), (61, 60)]
+    obstacle = [(61, 61), (62, 62)]
+
+    first.observe(free, obstacle)
+    second.observe(reversed(free), reversed(obstacle))
+
+    assert first.cells == second.cells
+    assert {
+        cell: first.classify(cell) for cell in first.cells
+    } == {
+        cell: second.classify(cell) for cell in second.cells
+    }
