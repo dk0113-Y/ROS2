@@ -1051,6 +1051,7 @@ def valid_continuous_parameter_harness(fusion_mode, occlusion_mode):
         ("legacy", "off"),
         ("evidence", "off"),
         ("evidence", "opaque"),
+        ("evidence", "confirmed_opaque"),
     ),
 )
 def test_supported_fusion_occlusion_combinations_are_accepted(
@@ -1074,6 +1075,31 @@ def test_legacy_opaque_fusion_combination_is_rejected():
         ValueError,
         match="opaque.*requires.*evidence",
     ):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_legacy_confirmed_opaque_fusion_combination_is_rejected():
+    """Confirmed opacity is also restricted to evidence fusion."""
+    harness = valid_continuous_parameter_harness(
+        "legacy",
+        "confirmed_opaque",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="confirmed_opaque.*requires.*evidence",
+    ):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_unknown_occlusion_mode_is_rejected():
+    """Configuration cannot silently fall back from an unknown mode."""
+    harness = valid_continuous_parameter_harness(
+        "evidence",
+        "unconfirmed_opaque",
+    )
+
+    with pytest.raises(ValueError, match="coarse_occlusion_mode must be"):
         RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
 
 

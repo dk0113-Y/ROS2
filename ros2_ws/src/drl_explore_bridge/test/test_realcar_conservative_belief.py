@@ -15,6 +15,7 @@ from drl_explore_bridge.realcar_conservative_belief import (
     ProjectedBeliefObservation,
     apply_evidence_fusion,
     apply_legacy_fusion,
+    cumulative_occlusion_cells,
     named_fusion_config,
     ordered_coarse_ray_cells,
     project_scan_to_belief,
@@ -445,6 +446,58 @@ def test_opaque_cross_ray_endpoint_blocks_rear_free_and_obstacle_evidence():
     )
 
 
+def test_confirmed_opaque_unconfirmed_endpoint_does_not_cross_ray_block():
+    """One current endpoint cannot block until belief classifies its cell."""
+    scan = make_multi_scan(
+        [1.0, 1.8],
+        angle_min=0.10,
+        angle_increment=-0.20,
+    )
+
+    baseline = project(scan, laser_x=0.0)
+    confirmed = project(
+        scan,
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+    )
+
+    assert (60, 63) in confirmed.obstacle_cells
+    assert (60, 64) in confirmed.free_cells
+    assert (61, 65) in confirmed.obstacle_cells
+    np.testing.assert_array_equal(confirmed.local_snap, baseline.local_snap)
+    assert confirmed.free_cells == baseline.free_cells
+    assert confirmed.obstacle_cells == baseline.obstacle_cells
+    assert confirmed.occlusion_blocker_cells == frozenset()
+    assert confirmed.occlusion_suppressed_cells == frozenset()
+
+
+def test_confirmed_opaque_obstacle_blocks_rear_but_receives_evidence():
+    """A confirmed obstacle is visible while evidence behind it is hidden."""
+    blocker = (60, 63)
+    observation = project(
+        make_multi_scan(
+            [1.0, 1.8],
+            angle_min=0.10,
+            angle_increment=-0.20,
+        ),
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+        historical_obstacle_cells={blocker},
+    )
+
+    assert blocker in observation.occlusion_blocker_cells
+    assert blocker in observation.free_cells
+    assert blocker in observation.obstacle_cells
+    assert (60, 64) not in observation.free_cells
+    assert (61, 65) not in observation.obstacle_cells
+    assert observation.occlusion_suppressed_free_cells == frozenset(
+        {(60, 64), (60, 65)}
+    )
+    assert observation.occlusion_suppressed_obstacle_cells == frozenset(
+        {(61, 65)}
+    )
+
+
 def test_opaque_preserves_free_evidence_before_first_blocker():
     """Opacity suppresses only evidence strictly behind the blocker cell."""
     observation = project(
@@ -494,6 +547,47 @@ def test_historical_obstacle_can_reverse_before_rear_evidence_resumes():
     assert rear in future.free_cells
 
 
+def test_confirmed_obstacle_reverses_before_rear_evidence_resumes():
+    """Candidate A can clear a confirmed blocker, reopening later frames."""
+    belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    blocker = (60, 63)
+    rear = (60, 64)
+    obstacle_frame = evidence_observation(obstacle={blocker})
+    apply_evidence_fusion(belief, accumulator, obstacle_frame)
+    apply_evidence_fusion(belief, accumulator, obstacle_frame)
+    assert belief.map[5, 8] == OBSTACLE
+
+    for _index in range(3):
+        historical_blockers, visited_cells = cumulative_occlusion_cells(
+            belief
+        )
+        observation = project(
+            make_scan(1.8),
+            laser_x=0.0,
+            coarse_occlusion_mode="confirmed_opaque",
+            historical_obstacle_cells=historical_blockers,
+            occlusion_exempt_cells=visited_cells,
+        )
+        assert blocker in observation.free_cells
+        assert rear not in observation.free_cells
+        apply_evidence_fusion(belief, accumulator, observation)
+
+    assert belief.map[5, 8] == EMPTY
+    historical_blockers, visited_cells = cumulative_occlusion_cells(belief)
+    future = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+        historical_obstacle_cells=historical_blockers,
+        occlusion_exempt_cells=visited_cells,
+    )
+    assert blocker not in future.occlusion_blocker_cells
+    assert rear in future.free_cells
+
+
 def test_occlusion_never_erases_historical_rear_free_state():
     """No current evidence leaves an already-known rear cell unchanged."""
     belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
@@ -517,6 +611,29 @@ def test_occlusion_never_erases_historical_rear_free_state():
     assert belief.map[5, 9] == EMPTY
 
 
+def test_confirmed_occlusion_never_erases_historical_rear_free_state():
+    """Confirmed opacity suppresses a frame without erasing rear history."""
+    belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
+    blocker = (60, 63)
+    rear = (60, 64)
+    belief.map[5, 8] = OBSTACLE
+    belief.map[5, 9] = EMPTY
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    observation = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+        historical_obstacle_cells={blocker},
+    )
+
+    assert rear not in observation.free_cells
+    assert rear not in observation.obstacle_cells
+    apply_evidence_fusion(belief, accumulator, observation)
+    assert belief.map[5, 9] == EMPTY
+
+
 def test_visited_agent_cell_is_not_an_occlusion_blocker():
     """An endpoint quantized onto the robot cell cannot hide all other rays."""
     observation = project(
@@ -529,6 +646,29 @@ def test_visited_agent_cell_is_not_an_occlusion_blocker():
     assert ORIGIN_STATE in observation.obstacle_cells
     assert (60, 61) in observation.free_cells
     assert (60, 62) in observation.free_cells
+
+
+def test_confirmed_opaque_excludes_visited_obstacles_from_blockers():
+    """Visited cells remain authoritative even if a stale map value is set."""
+    belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
+    blocker = (60, 63)
+    rear = (60, 64)
+    belief.map[5, 8] = OBSTACLE
+    belief.visit_count[5, 8] = 1
+
+    historical_blockers, visited_cells = cumulative_occlusion_cells(belief)
+    observation = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+        historical_obstacle_cells=historical_blockers,
+        occlusion_exempt_cells=visited_cells,
+    )
+
+    assert blocker not in historical_blockers
+    assert blocker in visited_cells
+    assert blocker not in observation.occlusion_blocker_cells
+    assert rear in observation.free_cells
 
 
 def test_ordered_supercover_is_unique_and_includes_corner_side_cells():
@@ -570,6 +710,19 @@ def test_opaque_corner_supercover_blocker_stops_diagonal_evidence():
     assert (59, 61) in baseline.free_cells
     assert (59, 61) not in opaque.free_cells
     assert (59, 60) in opaque.occlusion_blocker_cells
+
+
+def test_confirmed_opaque_corner_supercover_is_deterministic():
+    """Confirmed blockers use the same exact-corner supercover ordering."""
+    observation = project(
+        make_scan(1.0, angle=math.pi / 4.0),
+        laser_x=0.0,
+        coarse_occlusion_mode="confirmed_opaque",
+        historical_obstacle_cells={(59, 60)},
+    )
+
+    assert (59, 61) not in observation.free_cells
+    assert (59, 60) in observation.occlusion_blocker_cells
 
 
 def test_default_occlusion_mode_is_exact_legacy_projection_regression():

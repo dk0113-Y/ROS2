@@ -448,8 +448,11 @@ def project_scan_to_belief(
     if scan_radius_cells < 1:
         raise ValueError("scan_radius_cells must be >= 1")
     occlusion_mode = str(coarse_occlusion_mode).strip().lower()
-    if occlusion_mode not in ("off", "opaque"):
-        raise ValueError("coarse_occlusion_mode must be 'off' or 'opaque'")
+    if occlusion_mode not in ("off", "opaque", "confirmed_opaque"):
+        raise ValueError(
+            "coarse_occlusion_mode must be 'off', 'opaque', or "
+            "'confirmed_opaque'"
+        )
 
     local_size = 2 * int(scan_radius_cells) + 1
     center = int(scan_radius_cells)
@@ -564,7 +567,7 @@ def project_scan_to_belief(
     suppressed_free_cells: set[tuple[int, int]] = set()
     suppressed_obstacle_cells: set[tuple[int, int]] = set()
 
-    if occlusion_mode == "opaque":
+    if occlusion_mode in ("opaque", "confirmed_opaque"):
         exemptions = {
             (int(row), int(col)) for row, col in occlusion_exempt_cells
         }
@@ -573,7 +576,8 @@ def project_scan_to_belief(
             (int(row), int(col))
             for row, col in historical_obstacle_cells
         }
-        blockers.update(obstacle_cells)
+        if occlusion_mode == "opaque":
+            blockers.update(obstacle_cells)
         blockers.difference_update(exemptions)
         opaque_free_cells: set[tuple[int, int]] = set()
         opaque_obstacle_cells: set[tuple[int, int]] = set()

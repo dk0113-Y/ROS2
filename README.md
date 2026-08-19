@@ -285,10 +285,12 @@ python3 plot_slam_map_with_map_frame_trajectory_clean.py
 - 多种 LaserScan-to-local-grid 诊断模式
 - policy probe、单步/多步 bridge 和 trajectory replay nodes
 - Bash runbooks 与历史仿真摘要
-- 实车 deployment-side evidence fusion 与可选 coarse policy-cell occlusion；默认
-  `coarse_occlusion_mode=off` 保持旧投影，显式 `opaque` 仅抑制 blocker 后方的当前帧
-  LiDAR evidence，不擦除历史 belief、不读取 SLAM `/map`、不改变 evidence hysteresis。
-  参数、离线 replay 和解释边界见 [`scripts_realcar/README.md`](scripts_realcar/README.md)。
+- 实车 deployment-side evidence fusion 与可选 coarse policy-cell occlusion；默认 `off`
+  保持旧投影，实验模式 `opaque` 保留 endpoint + confirmed obstacle 的 v1 语义，新增
+  `confirmed_opaque` 仅允许累计 belief 中正式分类的 OBSTACLE 阻挡 LOS。两种遮挡都只
+  抑制 blocker 后方的当前帧 LiDAR evidence，不擦除历史 belief、不读取 SLAM `/map`、
+  不改变 evidence hysteresis，且只允许与 evidence fusion 配合。参数、离线 replay 和
+  解释边界见 [`scripts_realcar/README.md`](scripts_realcar/README.md)。
 
 仍需验证或补充：
 

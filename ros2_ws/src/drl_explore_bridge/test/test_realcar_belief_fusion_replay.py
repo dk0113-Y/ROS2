@@ -123,8 +123,8 @@ def test_named_candidates_are_always_scheduled_by_cli_defaults():
     }
 
 
-def test_cli_accepts_explicit_off_and_opaque_counterfactual_modes():
-    """The same bag can schedule both projection visibility rules."""
+def test_cli_accepts_all_counterfactual_occlusion_modes():
+    """The same bag can schedule all projection visibility rules."""
     args = replay.build_argument_parser().parse_args(
         [
             "--bag",
@@ -137,7 +137,13 @@ def test_cli_accepts_explicit_off_and_opaque_counterfactual_modes():
             "off",
             "--coarse-occlusion-mode",
             "opaque",
+            "--coarse-occlusion-mode",
+            "confirmed_opaque",
         ]
     )
 
-    assert args.coarse_occlusion_mode == ["off", "opaque"]
+    assert args.coarse_occlusion_mode == [
+        "off",
+        "opaque",
+        "confirmed_opaque",
+    ]

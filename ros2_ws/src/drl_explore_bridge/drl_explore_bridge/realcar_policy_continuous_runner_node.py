@@ -1099,13 +1099,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         if occlusion_mode not in (
             "off",
             "opaque",
+            "confirmed_opaque",
         ):
             raise ValueError(
-                "coarse_occlusion_mode must be 'off' or 'opaque'"
+                "coarse_occlusion_mode must be 'off', 'opaque', or "
+                "'confirmed_opaque'"
             )
-        if fusion_mode == "legacy" and occlusion_mode == "opaque":
+        if fusion_mode == "legacy" and occlusion_mode != "off":
             raise ValueError(
-                "coarse_occlusion_mode='opaque' requires "
+                f"coarse_occlusion_mode='{occlusion_mode}' requires "
                 "belief_fusion_mode='evidence'"
             )
         if not math.isclose(
@@ -1225,9 +1227,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         historical_blockers: frozenset[tuple[int, int]] = frozenset()
         visited_cells: frozenset[tuple[int, int]] = frozenset()
         cumulative_map = getattr(self, "_final_cum_map", None)
-        if (
-            occlusion_mode == "opaque"
-            and cumulative_map is not None
+        if occlusion_mode in ("opaque", "confirmed_opaque") and (
+            cumulative_map is not None
         ):
             historical_blockers, visited_cells = cumulative_occlusion_cells(
                 cumulative_map

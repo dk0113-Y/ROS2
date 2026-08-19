@@ -243,15 +243,23 @@ evidence margin 和可选 consecutive streak 形成可逆滞回：单个 endpoin
 通过累计 map 的 bounds、dirty-frontier、obstacle cache、coverage 和 analysis-box hooks；
 不修改 DRL 仓库 `CumulativeBeliefMap`，也不把 SLAM `/map` 输入 policy。
 
-`coarse_occlusion_mode=off` 是向后兼容默认值，保持上述逐 beam evidence 投影不变。
-仅在显式设置 `coarse_occlusion_mode=opaque` 时，投影才把本 decision frame 的全部
-coarse endpoint cells 与当前累计 belief 中的 OBSTACLE cells 作为 `0.35m` policy-cell
-LOS blocker，并以有序 supercover traversal 在每条 ray 的第一个 blocker 处停止后方
-FREE/OBSTACLE evidence。blocker cell 自身仍可获得穿越 beam 的 FREE candidate，因此
-已有 OBSTACLE 可继续通过原 candidate hysteresis 逆转；visited robot cells 始终是
-authoritative FREE。遮挡只抑制当前帧 evidence，不会把历史 FREE/OBSTACLE 写回
-INVISIBLE，不修改 frontier 算法，也不修改 `candidate_a` 等 evidence 阈值。该模式仍只使用
-LaserScan、odom 与 deployment cumulative belief，不读取 SLAM `/map`。
+`coarse_occlusion_mode` 有三个显式值：
+
+- `off`：向后兼容默认值，保持上述逐 beam evidence 投影不变，也是 legacy fusion 唯一
+  支持的 occlusion 设置。
+- `opaque`：冻结的 v1 实验语义；本 decision frame 的全部 coarse endpoint cells 与当前
+  累计 belief 中正式分类的 OBSTACLE cells 都作为 `0.35m` policy-cell LOS blocker。
+- `confirmed_opaque`：v2 实验语义；只有当前累计 belief 中正式分类为 OBSTACLE 且未被访问的
+  cells 才能作为 blocker。单帧 endpoint 在通过 evidence hysteresis 正式晋升为 OBSTACLE
+  前不会跨 ray 遮挡后方 cells；晋升后从后续投影帧开始阻挡。
+
+两种 opaque 模式都只允许与 `belief_fusion_mode=evidence` 配合，并以有序 supercover
+traversal 在每条 ray 的第一个 blocker 处停止其后方 FREE/OBSTACLE evidence。blocker cell
+自身仍可获得穿越 beam 的 FREE candidate，因此已有 OBSTACLE 可继续通过原 candidate
+hysteresis 逆转；一旦逆转为 FREE，后续帧会恢复其后方 evidence。visited robot cells 始终是
+authoritative FREE。遮挡只抑制当前帧 evidence，不会把历史 FREE/OBSTACLE 写回 INVISIBLE，
+不修改 frontier 算法，也不修改 `candidate_a` 等 evidence 阈值。投影只使用 LaserScan、odom
+与 deployment cumulative belief，不读取 SLAM `/map` 作为 policy input。
 
 episode 顶层和每步 JSON 会记录 `coarse_occlusion_mode`，并记录 blocker、suppressed FREE、
 suppressed OBSTACLE 与去重 suppressed cells 的 per-step counts 和 episode totals。
@@ -265,7 +273,8 @@ python3 scripts_realcar/analyze_belief_fusion_replay.py \
   --episode-json /absolute/path/to/episode.json \
   --output-dir /absolute/path/to/replay_report \
   --coarse-occlusion-mode off \
-  --coarse-occlusion-mode opaque
+  --coarse-occlusion-mode opaque \
+  --coarse-occlusion-mode confirmed_opaque
 ```
 
 工具以 episode `observation_pose.odom_timestamp` 为 canonical decision time，在默认
@@ -401,8 +410,10 @@ ros2 run drl_explore_bridge realcar_policy_continuous_runner_node --ros-args \
   -p coarse_occlusion_mode:=off
 ```
 
-将最后一项显式改为 `coarse_occlusion_mode:=opaque` 才启用 policy-cell opaque LOS；
-未指定时始终为 `off`。
+将最后一项显式改为 `coarse_occlusion_mode:=opaque` 可复现 endpoint + confirmed obstacle
+blocker 的 v1；改为 `coarse_occlusion_mode:=confirmed_opaque` 则只允许正式分类的累计
+OBSTACLE cells 阻挡 LOS。两者都要求 `belief_fusion_mode:=evidence`；未指定时始终为 `off`，
+legacy fusion 也只支持 `off`。
 
 `execute=false` 只验证 loop、belief、inference、sensor barrier、termination plumbing 和
 JSON logging；静止机器人不会提供真实运动后的状态变化，因此不能证明连续自主探索。

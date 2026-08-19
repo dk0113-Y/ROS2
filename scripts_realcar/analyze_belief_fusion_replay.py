@@ -375,8 +375,11 @@ def replay_mode(
         raise ValueError("evidence replay requires a fusion config")
     fusion_mode = "legacy" if config is None else "evidence"
     occlusion_mode = str(coarse_occlusion_mode).strip().lower()
-    if occlusion_mode not in ("off", "opaque"):
-        raise ValueError("coarse_occlusion_mode must be 'off' or 'opaque'")
+    if occlusion_mode not in ("off", "opaque", "confirmed_opaque"):
+        raise ValueError(
+            "coarse_occlusion_mode must be 'off', 'opaque', or "
+            "'confirmed_opaque'"
+        )
     cell_size = float(episode.get("cell_size", 0.35))
     if not math.isclose(cell_size, 0.35, rel_tol=0.0, abs_tol=1.0e-9):
         raise ValueError(
@@ -422,7 +425,9 @@ def replay_mode(
         decision = match.decision
         historical_blockers: frozenset[tuple[int, int]] = frozenset()
         visited_cells: frozenset[tuple[int, int]] = frozenset()
-        if occlusion_mode == "opaque" and cum_map is not None:
+        if occlusion_mode in ("opaque", "confirmed_opaque") and (
+            cum_map is not None
+        ):
             historical_blockers, visited_cells = cumulative_occlusion_cells(
                 cum_map
             )
@@ -867,11 +872,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--coarse-occlusion-mode",
         action="append",
-        choices=("off", "opaque"),
+        choices=("off", "opaque", "confirmed_opaque"),
         default=None,
         help=(
-            "projection mode to replay; repeat with off and opaque for a "
-            "counterfactual comparison (default: off)"
+            "projection mode to replay; repeat with off, opaque, and "
+            "confirmed_opaque for a counterfactual comparison (default: off)"
         ),
     )
     parser.add_argument(
