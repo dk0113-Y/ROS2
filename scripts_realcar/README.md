@@ -503,3 +503,36 @@ and are diagnostic only. SLAM `/map` is used only for final secondary cell
 composition when a direct recorded map-to-odom transform is available. None of
 these same-recorded-data results establishes new closed-loop behavior, improved
 exploration efficiency, fewer safety fallbacks, or deployment safety.
+
+## Offline mixed-cell policy-view study
+
+`analyze_mixed_policy_view.py` replays the frozen categorical belief,
+evidence-aware effective frontier, recent trajectory, and real checkpoint at
+the ten recorded decisions. It first requires exact categorical/frontier
+reproduction and a 10/10 M0 raw-action match. Only after those gates pass does
+it construct M1/M2/M3 analysis-only map copies in which fixed persistent-mixed
+UNKNOWN cells are presented to the network as OBSTACLE. The cumulative map,
+visit map, evidence accumulator, frontier masks, checkpoint, DRL repository,
+and production runtime remain read-only and unchanged.
+
+The checkpoint path recorded in the study request may be absent on an analysis
+machine. The tool permits an explicit read-only fallback only when its SHA-256
+matches the frozen checkpoint identity; it never copies or links a checkpoint
+into the DRL repository. Run in the ROS 2 Humble Python environment:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/robot/robot_repos/ROS2
+python3 scripts_realcar/analyze_mixed_policy_view.py \
+  --dataset-root /home/robot/robot_data/evidenceaware10_20260819_175106
+```
+
+Results are written by default to
+`DATASET_ROOT/mixed_policy_view_study/`: one JSON report, one cell CSV, and
+three PNG diagnostics. They are local evidence artifacts and must not be
+committed. Pre-motion feasibility uses the nearest causal recorded scan when
+the exact refreshed live scan is unavailable and is therefore always labeled
+`SAFETY_FEASIBILITY_PROXY`. SLAM and center-clearance measurements are
+secondary analysis only and never enter policy input. Same-recorded-state
+counterfactuals cannot demonstrate closed-loop improvement or deployment
+safety.

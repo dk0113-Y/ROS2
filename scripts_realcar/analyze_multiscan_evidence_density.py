@@ -1813,8 +1813,9 @@ def evaluate_slam_composition(
     contents: BagContents,
     baseline: DecisionModeArtifacts,
     geometry: dict[str, Any],
+    evaluation_cells: Optional[Sequence[tuple[int, int]]] = None,
 ) -> dict[str, Any]:
-    """Evaluate baseline unresolved cell footprints on the final SLAM map."""
+    """Evaluate selected policy-cell footprints on the final SLAM map."""
     if contents.final_map is None:
         return {
             "status": "NOT_AVAILABLE",
@@ -1867,7 +1868,14 @@ def evaluate_slam_composition(
     odom_y = -transform_sin * delta_x + transform_cos * delta_y
     half_cell = geometry["cell_size"] * 0.5
     cell_rows = []
-    for cell in _unresolved_cells(baseline.cum_map, baseline.accumulator):
+    selected_cells = (
+        _unresolved_cells(baseline.cum_map, baseline.accumulator)
+        if evaluation_cells is None
+        else sorted(
+            {(int(row), int(col)) for row, col in evaluation_cells}
+        )
+    )
+    for cell in selected_cells:
         center_x = geometry["origin_x"] + (
             cell[1] - geometry["origin_state"][1]
         ) * geometry["cell_size"]
@@ -1883,13 +1891,15 @@ def evaluate_slam_composition(
         unknown = int(np.count_nonzero(values < 0))
         occupied = int(np.count_nonzero(values >= 50))
         free = total - unknown - occupied
-        decision_state = baseline.accumulator.cells[cell]
+        decision_state = baseline.accumulator.cells.get(cell)
         cell_rows.append(
             {
                 "row": cell[0],
                 "col": cell[1],
                 "decision_conflict_count": (
                     decision_state.conflict_frame_count
+                    if decision_state is not None
+                    else 0
                 ),
                 "slam_pixel_count": total,
                 "slam_free_pixel_fraction": (
