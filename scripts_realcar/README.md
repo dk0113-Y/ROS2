@@ -469,3 +469,37 @@ Round 8 的 0.35m cardinal step、约 0.495m diagonal step、动态停车阈值�
 且未包含 `scripts_realcar`，相对路径 source 会显示 “No such file or directory”，即使
 commit 中存在该文件。应先在仓库根目录确认文件已 materialize，并优先使用上面的绝对
 路径；不要把 shell 中残留的 ROS 环境误当作脚本已成功执行。
+
+## Offline multi-scan evidence-density study
+
+`analyze_multiscan_evidence_density.py` is an analysis-only replay tool for a
+recorded episode. It never creates a ROS node, publishes `/cmd_vel`, reads a
+checkpoint, or writes to the source dataset. The baseline path calls the
+production `project_scan_to_belief()`, `BeliefEvidenceAccumulator`,
+`apply_evidence_fusion()`, `cumulative_occlusion_cells()`, and
+`frontier_semantics_snapshot()` functions without modifying them. The DDA
+supercover and endpoint-margin variants exist only inside the analysis script.
+
+The script first verifies the extracted `SHA256SUMS.txt`, checks the optional
+outer archive hash, matches all ten JSON scan timestamps, and requires an exact
+categorical replay of the frozen live result. A baseline mismatch stops the run
+before any counterfactual is evaluated. Run it only in a ROS 2 Humble Python
+environment:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/robot/robot_repos/ROS2
+PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages \
+python3 scripts_realcar/analyze_multiscan_evidence_density.py \
+  --dataset-root /home/robot/robot_data/evidenceaware10_20260819_175106
+```
+
+By default, machine-readable results and the four diagnostic PNGs are written
+under `DATASET_ROOT/multiscan_study/`. Dataset copies, rosbag files, arrays,
+JSON/CSV study results, and images are evidence artifacts and must not be
+committed. The fixed B3/B5 burst modes aggregate each causal burst into one
+evidence epoch; D1/D2/D5 intentionally change the temporal meaning of a frame
+and are diagnostic only. SLAM `/map` is used only for final secondary cell
+composition when a direct recorded map-to-odom transform is available. None of
+these same-recorded-data results establishes new closed-loop behavior, improved
+exploration efficiency, fewer safety fallbacks, or deployment safety.
