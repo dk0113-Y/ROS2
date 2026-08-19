@@ -30,6 +30,7 @@ from drl_explore_bridge.realcar_conservative_belief import (  # noqa: E402
     OBSTACLE,
     apply_evidence_fusion,
     apply_legacy_fusion,
+    cumulative_occlusion_cells,
     named_fusion_config,
     project_scan_to_belief,
     record_traversed_cells_as_free,
@@ -367,10 +368,15 @@ def replay_mode(
     matches: Sequence[MatchedDecision],
     episode: dict[str, Any],
     cumulative_map_type: Any,
+    coarse_occlusion_mode: str = "off",
 ) -> tuple[Any, np.ndarray, dict[str, Any]]:
     """Rebuild one final cumulative belief without issuing motion commands."""
     if mode_name != "legacy" and config is None:
         raise ValueError("evidence replay requires a fusion config")
+    fusion_mode = "legacy" if config is None else "evidence"
+    occlusion_mode = str(coarse_occlusion_mode).strip().lower()
+    if occlusion_mode not in ("off", "opaque"):
+        raise ValueError("coarse_occlusion_mode must be 'off' or 'opaque'")
     cell_size = float(episode.get("cell_size", 0.35))
     if not math.isclose(cell_size, 0.35, rel_tol=0.0, abs_tol=1.0e-9):
         raise ValueError(
@@ -404,10 +410,22 @@ def replay_mode(
         "evidence_conflict_frame_observation_count": 0,
         "evidence_free_frame_observation_count": 0,
         "evidence_obstacle_frame_observation_count": 0,
+        "obstacle_promotion_count": 0,
+        "occlusion_blocker_cell_count": 0,
+        "occlusion_suppressed_free_cell_count": 0,
+        "occlusion_suppressed_obstacle_cell_count": 0,
+        "occlusion_suppressed_cell_count": 0,
     }
+    occlusion_step_history: list[dict[str, int]] = []
 
     for match in matches:
         decision = match.decision
+        historical_blockers: frozenset[tuple[int, int]] = frozenset()
+        visited_cells: frozenset[tuple[int, int]] = frozenset()
+        if occlusion_mode == "opaque" and cum_map is not None:
+            historical_blockers, visited_cells = cumulative_occlusion_cells(
+                cum_map
+            )
         observation = project_scan_to_belief(
             match.scan.message,
             robot_x=decision.robot_x,
@@ -422,10 +440,13 @@ def replay_mode(
             laser_x_in_base=laser_x,
             laser_y_in_base=laser_y,
             laser_yaw_in_base=laser_yaw,
+            coarse_occlusion_mode=occlusion_mode,
+            historical_obstacle_cells=historical_blockers,
+            occlusion_exempt_cells=visited_cells,
         )
         core_snap = (
             observation.local_snap
-            if mode_name == "legacy"
+            if fusion_mode == "legacy"
             else visited_only_local_snap(tuple(observation.local_snap.shape))
         )
         if cum_map is None:
@@ -436,7 +457,7 @@ def replay_mode(
             )
         else:
             cum_map.update(decision.agent_state, core_snap)
-        if mode_name == "legacy":
+        if fusion_mode == "legacy":
             step_stats = apply_legacy_fusion(cum_map, observation)
         else:
             if accumulator is None:
@@ -461,6 +482,34 @@ def replay_mode(
         transition_totals[
             "evidence_obstacle_frame_observation_count"
         ] += step_stats.evidence_obstacle_cells_this_step
+        transition_totals["obstacle_promotion_count"] += (
+            step_stats.invisible_to_obstacle_transitions_this_step
+            + step_stats.free_to_obstacle_transitions_this_step
+        )
+        step_occlusion = {
+            "step_id": int(decision.step_id),
+            "blocker_cells": len(observation.occlusion_blocker_cells),
+            "suppressed_free_cells": len(
+                observation.occlusion_suppressed_free_cells
+            ),
+            "suppressed_obstacle_cells": len(
+                observation.occlusion_suppressed_obstacle_cells
+            ),
+            "suppressed_cells": len(observation.occlusion_suppressed_cells),
+        }
+        occlusion_step_history.append(step_occlusion)
+        transition_totals["occlusion_blocker_cell_count"] += (
+            step_occlusion["blocker_cells"]
+        )
+        transition_totals["occlusion_suppressed_free_cell_count"] += (
+            step_occlusion["suppressed_free_cells"]
+        )
+        transition_totals[
+            "occlusion_suppressed_obstacle_cell_count"
+        ] += step_occlusion["suppressed_obstacle_cells"]
+        transition_totals["occlusion_suppressed_cell_count"] += (
+            step_occlusion["suppressed_cells"]
+        )
         known_history.append(
             int(np.count_nonzero(np.asarray(cum_map.map) != INVISIBLE))
         )
@@ -483,7 +532,9 @@ def replay_mode(
     known_count = free_count + obstacle_count
     metrics: dict[str, Any] = {
         "mode": mode_name,
+        "fusion_mode": fusion_mode,
         "fusion_config": config.as_dict() if config is not None else None,
+        "coarse_occlusion_mode": occlusion_mode,
         "unknown_count": unknown_count,
         "free_count": free_count,
         "obstacle_count": obstacle_count,
@@ -497,6 +548,7 @@ def replay_mode(
         "frontier_count": int(np.count_nonzero(frontier > 0)),
         "known_area_history": known_history,
         "frontier_count_history": frontier_history,
+        "occlusion_step_history": occlusion_step_history,
         "origin_world_rc": [int(value) for value in cum_map.origin_world_rc],
         "belief_shape": [int(value) for value in belief.shape],
         "projection_config": {
@@ -507,6 +559,7 @@ def replay_mode(
             "laser_x_in_base_m": laser_x,
             "laser_y_in_base_m": laser_y,
             "laser_yaw_in_base": laser_yaw,
+            "coarse_occlusion_mode": occlusion_mode,
         },
         **transition_totals,
         **_trajectory_obstacle_diagnostics(cum_map, trajectory),
@@ -662,7 +715,7 @@ def _csv_value(value: Any) -> Any:
 
 
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
-    """Execute scan matching, four baseline replays, and artifact export."""
+    """Execute scan matching, requested projection modes, and export."""
     episode_path = args.episode_json.expanduser().resolve()
     bag_path = args.bag.expanduser().resolve()
     output_directory = args.output_dir.expanduser().resolve()
@@ -682,10 +735,20 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         config = load_custom_fusion_config(raw_config)
         configs = [item for item in configs if item.name != config.name]
         configs.append(config)
-    mode_specs: list[tuple[str, Optional[BeliefFusionConfig]]] = [
-        ("legacy", None)
-    ]
-    mode_specs.extend((config.name, config) for config in configs)
+    requested_occlusion_modes = args.coarse_occlusion_mode or ["off"]
+    occlusion_modes = list(dict.fromkeys(requested_occlusion_modes))
+    mode_specs: list[
+        tuple[str, Optional[BeliefFusionConfig], str]
+    ] = [("legacy", None, "off")]
+    multiple_projection_modes = len(occlusion_modes) > 1
+    for config in configs:
+        for occlusion_mode in occlusion_modes:
+            label = (
+                f"{config.name}_{occlusion_mode}"
+                if multiple_projection_modes or occlusion_mode != "off"
+                else config.name
+            )
+            mode_specs.append((label, config, occlusion_mode))
     cumulative_map_type = _load_cumulative_map_type(
         args.drl_repository.expanduser().resolve()
     )
@@ -694,17 +757,20 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     comparison_rows: list[dict[str, Any]] = []
     image_paths: list[tuple[str, Path]] = []
     legacy_map = None
+    replay_maps: dict[str, Any] = {}
 
-    for mode_name, config in mode_specs:
+    for mode_name, config, occlusion_mode in mode_specs:
         cum_map, frontier, metrics = replay_mode(
             mode_name,
             config,
             matches,
             episode,
             cumulative_map_type,
+            coarse_occlusion_mode=occlusion_mode,
         )
         if mode_name == "legacy":
             legacy_map = cum_map
+        replay_maps[mode_name] = cum_map
         image_path = export_mode(
             output_directory,
             mode_name,
@@ -721,11 +787,21 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         if legacy_map is not None
         else None
     )
+    saved_comparisons = {
+        mode_name: compare_saved_belief(cum_map, episode, episode_path)
+        for mode_name, cum_map in replay_maps.items()
+    }
     warnings = [
         "SLAM occupancy was not read or used to mutate any replay belief.",
         (
-            "Candidate thresholds are replay hypotheses, not validated "
-            "real-car settings."
+            "Recorded-observation replay does not validate a new occlusion "
+            "setting or any custom evidence-fusion thresholds."
+        ),
+        (
+            "Offline occlusion replay proves only LaserScan-to-belief/frontier "
+            "counterfactual behavior under recorded poses and scans; it cannot "
+            "prove new policy actions, safety outcomes, motion, observations, "
+            "or a reduced safety-intervention rate."
         ),
     ]
     for missing_key in (
@@ -746,6 +822,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         "scan_topic": args.scan_topic,
         "matching_statistics": matching_statistics,
         "legacy_saved_belief_comparison": saved_comparison,
+        "saved_belief_comparisons": saved_comparisons,
         "modes": comparison_rows,
         "warnings": warnings,
     }
@@ -787,6 +864,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--scan-topic", default="/scan")
     parser.add_argument("--scan-tolerance-sec", type=float, default=0.10)
+    parser.add_argument(
+        "--coarse-occlusion-mode",
+        action="append",
+        choices=("off", "opaque"),
+        default=None,
+        help=(
+            "projection mode to replay; repeat with off and opaque for a "
+            "counterfactual comparison (default: off)"
+        ),
+    )
     parser.add_argument(
         "--fusion-config",
         action="append",

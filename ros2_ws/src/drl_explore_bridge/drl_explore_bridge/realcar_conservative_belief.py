@@ -22,6 +22,20 @@ class ProjectedBeliefObservation:
     obstacle_cells: frozenset[tuple[int, int]]
     free_cells: frozenset[tuple[int, int]] = frozenset()
     conflict_cells: frozenset[tuple[int, int]] = frozenset()
+    coarse_occlusion_mode: str = "off"
+    occlusion_blocker_cells: frozenset[tuple[int, int]] = frozenset()
+    occlusion_suppressed_free_cells: frozenset[tuple[int, int]] = frozenset()
+    occlusion_suppressed_obstacle_cells: frozenset[tuple[int, int]] = (
+        frozenset()
+    )
+
+    @property
+    def occlusion_suppressed_cells(self) -> frozenset[tuple[int, int]]:
+        """Return unique cells denied any current-frame evidence."""
+        return frozenset(
+            self.occlusion_suppressed_free_cells
+            | self.occlusion_suppressed_obstacle_cells
+        )
 
 
 @dataclass(frozen=True)
@@ -253,6 +267,164 @@ def continuous_world_to_grid(
     return row, col
 
 
+def _ordered_coarse_ray_entries(
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    *,
+    origin_x: float,
+    origin_y: float,
+    origin_state: tuple[int, int],
+    cell_size: float,
+) -> tuple[tuple[tuple[int, int], float], ...]:
+    """Return deterministic supercover cells and normalized entry times."""
+    if not math.isfinite(cell_size) or cell_size <= 0.0:
+        raise ValueError("cell_size must be finite and > 0")
+    coordinates = (start_x, start_y, end_x, end_y, origin_x, origin_y)
+    if not all(math.isfinite(float(value)) for value in coordinates):
+        raise ValueError("ray and origin coordinates must be finite")
+
+    start_col_f = (
+        int(origin_state[1])
+        + (float(start_x) - float(origin_x)) / float(cell_size)
+        + 0.5
+    )
+    start_row_f = (
+        int(origin_state[0])
+        - (float(start_y) - float(origin_y)) / float(cell_size)
+        + 0.5
+    )
+    end_col_f = (
+        int(origin_state[1])
+        + (float(end_x) - float(origin_x)) / float(cell_size)
+        + 0.5
+    )
+    end_row_f = (
+        int(origin_state[0])
+        - (float(end_y) - float(origin_y)) / float(cell_size)
+        + 0.5
+    )
+    delta_col = end_col_f - start_col_f
+    delta_row = end_row_f - start_row_f
+    row = int(math.floor(start_row_f))
+    col = int(math.floor(start_col_f))
+    end_row = int(math.floor(end_row_f))
+    end_col = int(math.floor(end_col_f))
+    entries: list[tuple[tuple[int, int], float]] = [((row, col), 0.0)]
+    seen = {(row, col)}
+
+    step_col = 1 if delta_col > 0.0 else (-1 if delta_col < 0.0 else 0)
+    step_row = 1 if delta_row > 0.0 else (-1 if delta_row < 0.0 else 0)
+    t_delta_col = (
+        1.0 / abs(delta_col) if step_col else math.inf
+    )
+    t_delta_row = (
+        1.0 / abs(delta_row) if step_row else math.inf
+    )
+    next_col_boundary = col + 1 if step_col > 0 else col
+    next_row_boundary = row + 1 if step_row > 0 else row
+    t_max_col = (
+        (next_col_boundary - start_col_f) / delta_col
+        if step_col
+        else math.inf
+    )
+    t_max_row = (
+        (next_row_boundary - start_row_f) / delta_row
+        if step_row
+        else math.inf
+    )
+
+    def append(cell: tuple[int, int], entry_time: float) -> None:
+        if cell not in seen:
+            entries.append((cell, max(0.0, min(1.0, float(entry_time)))))
+            seen.add(cell)
+
+    maximum_iterations = (
+        abs(end_row - row) + abs(end_col - col) + 2
+    ) * 3
+    iterations = 0
+    epsilon = 1.0e-12
+    while (row, col) != (end_row, end_col):
+        iterations += 1
+        if iterations > maximum_iterations:
+            raise RuntimeError("coarse ray traversal did not converge")
+        if t_max_col + epsilon < t_max_row:
+            col += step_col
+            append((row, col), t_max_col)
+            t_max_col += t_delta_col
+        elif t_max_row + epsilon < t_max_col:
+            row += step_row
+            append((row, col), t_max_row)
+            t_max_row += t_delta_row
+        else:
+            corner_time = min(t_max_col, t_max_row)
+            side_cells = sorted(
+                ((row, col + step_col), (row + step_row, col))
+            )
+            for side_cell in side_cells:
+                append(side_cell, corner_time)
+            row += step_row
+            col += step_col
+            append((row, col), corner_time)
+            t_max_col += t_delta_col
+            t_max_row += t_delta_row
+    return tuple(entries)
+
+
+def ordered_coarse_ray_cells(
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    *,
+    origin_x: float,
+    origin_y: float,
+    origin_state: tuple[int, int],
+    cell_size: float,
+) -> tuple[tuple[int, int], ...]:
+    """Return the ordered unique policy-cell supercover for one segment."""
+    return tuple(
+        cell
+        for cell, _entry_time in _ordered_coarse_ray_entries(
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            origin_x=origin_x,
+            origin_y=origin_y,
+            origin_state=origin_state,
+            cell_size=cell_size,
+        )
+    )
+
+
+def cumulative_occlusion_cells(
+    cum_map: Any,
+) -> tuple[
+    frozenset[tuple[int, int]],
+    frozenset[tuple[int, int]],
+]:
+    """Extract historical obstacle blockers and authoritative visited cells."""
+    belief = np.asarray(cum_map.map)
+    visits = np.asarray(cum_map.visit_count)
+    origin_row, origin_col = (
+        int(cum_map.origin_world_rc[0]),
+        int(cum_map.origin_world_rc[1]),
+    )
+
+    def world_cells(mask: np.ndarray) -> frozenset[tuple[int, int]]:
+        rows, cols = np.nonzero(mask)
+        return frozenset(
+            (int(row) + origin_row, int(col) + origin_col)
+            for row, col in zip(rows, cols)
+        )
+
+    visited = world_cells(visits > 0)
+    blockers = world_cells((belief == OBSTACLE) & (visits <= 0))
+    return blockers, visited
+
+
 def project_scan_to_belief(
     scan: Any,
     *,
@@ -268,10 +440,16 @@ def project_scan_to_belief(
     laser_x_in_base: float,
     laser_y_in_base: float,
     laser_yaw_in_base: float,
+    coarse_occlusion_mode: str = "off",
+    historical_obstacle_cells: Iterable[tuple[int, int]] = (),
+    occlusion_exempt_cells: Iterable[tuple[int, int]] = (),
 ) -> ProjectedBeliefObservation:
     """Project one scan into legacy categories and global frame evidence."""
     if scan_radius_cells < 1:
         raise ValueError("scan_radius_cells must be >= 1")
+    occlusion_mode = str(coarse_occlusion_mode).strip().lower()
+    if occlusion_mode not in ("off", "opaque"):
+        raise ValueError("coarse_occlusion_mode must be 'off' or 'opaque'")
 
     local_size = 2 * int(scan_radius_cells) + 1
     center = int(scan_radius_cells)
@@ -283,6 +461,14 @@ def project_scan_to_belief(
     local_snap[center, center] = EMPTY
     free_cells: set[tuple[int, int]] = set()
     obstacle_cells: set[tuple[int, int]] = set()
+    ray_records: list[
+        tuple[
+            float,
+            float,
+            Optional[tuple[int, int]],
+            set[tuple[int, int]],
+        ]
+    ] = []
 
     robot_cos = math.cos(robot_yaw)
     robot_sin = math.sin(robot_yaw)
@@ -299,6 +485,17 @@ def project_scan_to_belief(
     local_radius_m = int(scan_radius_cells) * float(cell_size)
     sample_step = float(cell_size) / 3.0
 
+    def world_cell_is_visible(world_cell: tuple[int, int]) -> bool:
+        dr = int(world_cell[0]) - int(agent_state[0])
+        dc = int(world_cell[1]) - int(agent_state[1])
+        if dr * dr + dc * dc > scan_radius_cells * scan_radius_cells:
+            return False
+        local_row = center + dr
+        local_col = center + dc
+        if not (0 <= local_row < local_size and 0 <= local_col < local_size):
+            return False
+        return True
+
     def visible_world_cell(
         world_x: float,
         world_y: float,
@@ -311,13 +508,7 @@ def project_scan_to_belief(
             origin_state,
             cell_size,
         )
-        dr = int(world_cell[0]) - int(agent_state[0])
-        dc = int(world_cell[1]) - int(agent_state[1])
-        if dr * dr + dc * dc > scan_radius_cells * scan_radius_cells:
-            return None
-        local_row = center + dr
-        local_col = center + dc
-        if not (0 <= local_row < local_size and 0 <= local_col < local_size):
+        if not world_cell_is_visible(world_cell):
             return None
         return world_cell
 
@@ -363,6 +554,89 @@ def project_scan_to_belief(
         if hit_cell is not None:
             obstacle_cells.add(hit_cell)
 
+        ray_records.append(
+            (ray_range, world_yaw, hit_cell, ray_free_cells)
+        )
+
+    baseline_free_cells = set(free_cells)
+    baseline_obstacle_cells = set(obstacle_cells)
+    blocker_cells: set[tuple[int, int]] = set()
+    suppressed_free_cells: set[tuple[int, int]] = set()
+    suppressed_obstacle_cells: set[tuple[int, int]] = set()
+
+    if occlusion_mode == "opaque":
+        exemptions = {
+            (int(row), int(col)) for row, col in occlusion_exempt_cells
+        }
+        exemptions.add((int(agent_state[0]), int(agent_state[1])))
+        blockers = {
+            (int(row), int(col))
+            for row, col in historical_obstacle_cells
+        }
+        blockers.update(obstacle_cells)
+        blockers.difference_update(exemptions)
+        opaque_free_cells: set[tuple[int, int]] = set()
+        opaque_obstacle_cells: set[tuple[int, int]] = set()
+        epsilon = 1.0e-12
+
+        for ray_range, world_yaw, hit_cell, ray_free_cells in ray_records:
+            ray_cos = math.cos(world_yaw)
+            ray_sin = math.sin(world_yaw)
+            end_x = laser_origin_x + ray_range * ray_cos
+            end_y = laser_origin_y + ray_range * ray_sin
+            entries = _ordered_coarse_ray_entries(
+                laser_origin_x,
+                laser_origin_y,
+                end_x,
+                end_y,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                origin_state=origin_state,
+                cell_size=cell_size,
+            )
+            visible_entries = tuple(
+                (cell, entry_time)
+                for cell, entry_time in entries
+                if world_cell_is_visible(cell)
+            )
+            entry_times = {
+                cell: entry_time for cell, entry_time in visible_entries
+            }
+            encountered = {
+                cell for cell, _entry_time in visible_entries if cell in blockers
+            }
+            blocker_cells.update(encountered)
+            first_blocker_time = min(
+                (entry_times[cell] for cell in encountered),
+                default=None,
+            )
+
+            def evidence_is_visible(cell: tuple[int, int]) -> bool:
+                if first_blocker_time is None:
+                    return True
+                entry_time = entry_times.get(cell)
+                if entry_time is None:
+                    return False
+                if entry_time + epsilon < first_blocker_time:
+                    return True
+                return (
+                    abs(entry_time - first_blocker_time) <= epsilon
+                    and cell in blockers
+                )
+
+            opaque_free_cells.update(
+                cell for cell in ray_free_cells if evidence_is_visible(cell)
+            )
+            if hit_cell is not None and evidence_is_visible(hit_cell):
+                opaque_obstacle_cells.add(hit_cell)
+
+        free_cells = opaque_free_cells
+        obstacle_cells = opaque_obstacle_cells
+        suppressed_free_cells = baseline_free_cells - free_cells
+        suppressed_obstacle_cells = (
+            baseline_obstacle_cells - obstacle_cells
+        )
+
     conflict_cells = free_cells & obstacle_cells
 
     # Preserve the exact legacy categorical rule: any endpoint in a coarse
@@ -384,6 +658,14 @@ def project_scan_to_belief(
         obstacle_cells=frozenset(obstacle_cells),
         free_cells=frozenset(free_cells),
         conflict_cells=frozenset(conflict_cells),
+        coarse_occlusion_mode=occlusion_mode,
+        occlusion_blocker_cells=frozenset(blocker_cells),
+        occlusion_suppressed_free_cells=frozenset(
+            suppressed_free_cells
+        ),
+        occlusion_suppressed_obstacle_cells=frozenset(
+            suppressed_obstacle_cells
+        ),
     )
 
 

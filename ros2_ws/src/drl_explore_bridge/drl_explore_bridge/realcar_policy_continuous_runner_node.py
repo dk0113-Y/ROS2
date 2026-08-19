@@ -30,6 +30,7 @@ from drl_explore_bridge.realcar_conservative_belief import (
     ProjectedBeliefObservation,
     apply_evidence_fusion,
     apply_legacy_fusion,
+    cumulative_occlusion_cells,
     final_belief_cell_counts,
     named_fusion_config,
     project_scan_to_belief,
@@ -687,6 +688,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         )
         self.declare_parameter("belief_fusion_mode", "legacy")
         self.declare_parameter("belief_fusion_config", "candidate_a")
+        self.declare_parameter("coarse_occlusion_mode", "off")
 
         self.max_runtime_sec = float(
             self.get_parameter("max_runtime_sec").value
@@ -765,6 +767,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.fusion_config = named_fusion_config(
             str(self.get_parameter("belief_fusion_config").value).strip()
         )
+        self.coarse_occlusion_mode = str(
+            self.get_parameter("coarse_occlusion_mode").value
+        ).strip().lower()
 
         self._validate_continuous_parameters()
         self._last_dynamic_scan_sequence = self.scan_sequence
@@ -799,6 +804,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             ),
             "fusion_mode": self.fusion_mode,
             "fusion_config": self.fusion_config.as_dict(),
+            "coarse_occlusion_mode": self.coarse_occlusion_mode,
             "termination_parameters": {
                 "minimum_completion_decision_steps": (
                     self.minimum_completion_decision_steps
@@ -871,6 +877,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "evidence_free_cells_total": 0,
             "evidence_obstacle_cells_total": 0,
             "evidence_conflict_cells_total": 0,
+            "occlusion_blocker_cells_total": 0,
+            "occlusion_suppressed_free_cells_total": 0,
+            "occlusion_suppressed_obstacle_cells_total": 0,
+            "occlusion_suppressed_cells_total": 0,
             "free_to_obstacle_transitions_total": 0,
             "obstacle_to_free_transitions_total": 0,
             "local_escape_total_count": 0,
@@ -913,6 +923,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"action_source={action_source_for_mode(self.commissioning_mode)} "
             f"fusion_mode={self.fusion_mode} "
             f"fusion_config={self.fusion_config.name} "
+            f"coarse_occlusion_mode={self.coarse_occlusion_mode} "
             "sensor_executor=background_multithreaded "
             "sensor_callback_groups=independent "
             "completion_source=belief_only"
@@ -1083,6 +1094,13 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "evidence",
         ):
             raise ValueError("belief_fusion_mode must be 'legacy' or 'evidence'")
+        if getattr(self, "coarse_occlusion_mode", "off") not in (
+            "off",
+            "opaque",
+        ):
+            raise ValueError(
+                "coarse_occlusion_mode must be 'off' or 'opaque'"
+            )
         if not math.isclose(
             self.cell_size,
             CONTINUOUS_CELL_SIZE_M,
@@ -1196,6 +1214,17 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise RuntimeError("odom_state_origin is not initialized")
         pose = self.pose_record_from_odom(odom)
         origin_x, origin_y = self.odom_state_origin
+        occlusion_mode = getattr(self, "coarse_occlusion_mode", "off")
+        historical_blockers: frozenset[tuple[int, int]] = frozenset()
+        visited_cells: frozenset[tuple[int, int]] = frozenset()
+        cumulative_map = getattr(self, "_final_cum_map", None)
+        if (
+            occlusion_mode == "opaque"
+            and cumulative_map is not None
+        ):
+            historical_blockers, visited_cells = cumulative_occlusion_cells(
+                cumulative_map
+            )
         return project_scan_to_belief(
             scan,
             robot_x=pose["x"],
@@ -1210,6 +1239,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             laser_x_in_base=self.laser_x_in_base_m,
             laser_y_in_base=self.laser_y_in_base_m,
             laser_yaw_in_base=self.laser_yaw_in_base,
+            coarse_occlusion_mode=occlusion_mode,
+            historical_obstacle_cells=historical_blockers,
+            occlusion_exempt_cells=visited_cells,
         )
 
     def target_for_action(
@@ -1703,9 +1735,30 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "frontier_count": None,
                 "fusion_mode": self.fusion_mode,
                 "fusion_config": self.fusion_config.as_dict(),
+                "coarse_occlusion_mode": self.coarse_occlusion_mode,
                 "evidence_free_cells_this_step": 0,
                 "evidence_obstacle_cells_this_step": 0,
                 "evidence_conflict_cells_this_step": 0,
+                "occlusion_blocker_cells_this_step": 0,
+                "occlusion_suppressed_free_cells_this_step": 0,
+                "occlusion_suppressed_obstacle_cells_this_step": 0,
+                "occlusion_suppressed_cells_this_step": 0,
+                "occlusion_blocker_cells_total": self.experiment_result[
+                    "occlusion_blocker_cells_total"
+                ],
+                "occlusion_suppressed_free_cells_total": (
+                    self.experiment_result[
+                        "occlusion_suppressed_free_cells_total"
+                    ]
+                ),
+                "occlusion_suppressed_obstacle_cells_total": (
+                    self.experiment_result[
+                        "occlusion_suppressed_obstacle_cells_total"
+                    ]
+                ),
+                "occlusion_suppressed_cells_total": self.experiment_result[
+                    "occlusion_suppressed_cells_total"
+                ],
                 "free_to_obstacle_transitions_this_step": 0,
                 "obstacle_to_free_transitions_this_step": 0,
                 "free_to_obstacle_transitions_total": self.experiment_result[
@@ -1988,6 +2041,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"{record['evidence_obstacle_cells_this_step']} "
             "evidence_conflict_cells_this_step="
             f"{record['evidence_conflict_cells_this_step']} "
+            f"coarse_occlusion_mode={record['coarse_occlusion_mode']} "
+            "occlusion_blocker_cells_this_step="
+            f"{record['occlusion_blocker_cells_this_step']} "
+            "occlusion_suppressed_free_cells_this_step="
+            f"{record['occlusion_suppressed_free_cells_this_step']} "
+            "occlusion_suppressed_obstacle_cells_this_step="
+            f"{record['occlusion_suppressed_obstacle_cells_this_step']} "
+            "occlusion_suppressed_cells_this_step="
+            f"{record['occlusion_suppressed_cells_this_step']} "
             "free_to_obstacle_transitions_this_step="
             f"{record['free_to_obstacle_transitions_this_step']} "
             "obstacle_to_free_transitions_this_step="
@@ -2182,6 +2244,23 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         fusion_stats,
                         f"{key}_this_step",
                     )
+                occlusion_step_counts = {
+                    "occlusion_blocker_cells": len(
+                        observation.occlusion_blocker_cells
+                    ),
+                    "occlusion_suppressed_free_cells": len(
+                        observation.occlusion_suppressed_free_cells
+                    ),
+                    "occlusion_suppressed_obstacle_cells": len(
+                        observation.occlusion_suppressed_obstacle_cells
+                    ),
+                    "occlusion_suppressed_cells": len(
+                        observation.occlusion_suppressed_cells
+                    ),
+                }
+                for key, count in occlusion_step_counts.items():
+                    self.experiment_result.setdefault(f"{key}_total", 0)
+                    self.experiment_result[f"{key}_total"] += count
                 for key in (
                     "free_to_obstacle_transitions",
                     "obstacle_to_free_transitions",
@@ -2208,6 +2287,46 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         ),
                         "evidence_conflict_cells_this_step": (
                             fusion_stats.evidence_conflict_cells_this_step
+                        ),
+                        "occlusion_blocker_cells_this_step": (
+                            occlusion_step_counts[
+                                "occlusion_blocker_cells"
+                            ]
+                        ),
+                        "occlusion_suppressed_free_cells_this_step": (
+                            occlusion_step_counts[
+                                "occlusion_suppressed_free_cells"
+                            ]
+                        ),
+                        "occlusion_suppressed_obstacle_cells_this_step": (
+                            occlusion_step_counts[
+                                "occlusion_suppressed_obstacle_cells"
+                            ]
+                        ),
+                        "occlusion_suppressed_cells_this_step": (
+                            occlusion_step_counts[
+                                "occlusion_suppressed_cells"
+                            ]
+                        ),
+                        "occlusion_blocker_cells_total": (
+                            self.experiment_result[
+                                "occlusion_blocker_cells_total"
+                            ]
+                        ),
+                        "occlusion_suppressed_free_cells_total": (
+                            self.experiment_result[
+                                "occlusion_suppressed_free_cells_total"
+                            ]
+                        ),
+                        "occlusion_suppressed_obstacle_cells_total": (
+                            self.experiment_result[
+                                "occlusion_suppressed_obstacle_cells_total"
+                            ]
+                        ),
+                        "occlusion_suppressed_cells_total": (
+                            self.experiment_result[
+                                "occlusion_suppressed_cells_total"
+                            ]
                         ),
                         "free_to_obstacle_transitions_this_step": (
                             fusion_stats.free_to_obstacle_transitions_this_step

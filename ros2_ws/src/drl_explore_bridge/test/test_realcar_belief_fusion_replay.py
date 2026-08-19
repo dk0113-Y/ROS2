@@ -115,8 +115,29 @@ def test_named_candidates_are_always_scheduled_by_cli_defaults():
     )
 
     assert args.fusion_config == []
+    assert args.coarse_occlusion_mode is None
     assert set(replay.EVIDENCE_FUSION_CANDIDATES) == {
         "candidate_a",
         "candidate_b",
         "candidate_c",
     }
+
+
+def test_cli_accepts_explicit_off_and_opaque_counterfactual_modes():
+    """The same bag can schedule both projection visibility rules."""
+    args = replay.build_argument_parser().parse_args(
+        [
+            "--bag",
+            "bag",
+            "--episode-json",
+            "episode.json",
+            "--output-dir",
+            "output",
+            "--coarse-occlusion-mode",
+            "off",
+            "--coarse-occlusion-mode",
+            "opaque",
+        ]
+    )
+
+    assert args.coarse_occlusion_mode == ["off", "opaque"]

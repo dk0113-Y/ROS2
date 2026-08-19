@@ -16,6 +16,7 @@ from drl_explore_bridge.realcar_conservative_belief import (
     apply_evidence_fusion,
     apply_legacy_fusion,
     named_fusion_config,
+    ordered_coarse_ray_cells,
     project_scan_to_belief,
     promote_observed_obstacle_cells,
     record_traversed_cells_as_free,
@@ -57,6 +58,9 @@ def project(
     robot_yaw=0.0,
     agent_state=ORIGIN_STATE,
     laser_x=LASER_X,
+    coarse_occlusion_mode="off",
+    historical_obstacle_cells=(),
+    occlusion_exempt_cells=(),
 ):
     """Project with the production grid and verified planar extrinsic."""
     return project_scan_to_belief(
@@ -73,6 +77,9 @@ def project(
         laser_x_in_base=laser_x,
         laser_y_in_base=0.0,
         laser_yaw_in_base=0.0,
+        coarse_occlusion_mode=coarse_occlusion_mode,
+        historical_obstacle_cells=historical_obstacle_cells,
+        occlusion_exempt_cells=occlusion_exempt_cells,
     )
 
 
@@ -96,12 +103,14 @@ def frontier_mask(grid):
 class BeliefCacheHarness:
     """Expose the cache-maintenance surface used by the deployment helper."""
 
-    def __init__(self):
+    def __init__(self, size=5, origin_world_rc=(58, 58)):
         """Create one free frontier cell with populated derived caches."""
-        self.origin_world_rc = (58, 58)
-        self.map = np.full((5, 5), INVISIBLE, dtype=np.int8)
-        self.map[2, 2] = EMPTY
-        self.visit_count = np.zeros((5, 5), dtype=np.int32)
+        self.origin_world_rc = tuple(origin_world_rc)
+        self.map = np.full((size, size), INVISIBLE, dtype=np.int8)
+        center_row = ORIGIN_STATE[0] - self.origin_world_rc[0]
+        center_col = ORIGIN_STATE[1] - self.origin_world_rc[1]
+        self.map[center_row, center_col] = EMPTY
+        self.visit_count = np.zeros((size, size), dtype=np.int32)
         self.frontier_u8 = frontier_mask(self.map)
         self.frontier_revision = 1
         self._latest_frontier_stats = object()
@@ -112,8 +121,10 @@ class BeliefCacheHarness:
         self.visit_cache_invalidated = False
 
     def _ensure_world_bounds(self, min_row, max_row, min_col, max_col):
-        assert 58 <= min_row <= max_row <= 62
-        assert 58 <= min_col <= max_col <= 62
+        last_row = self.origin_world_rc[0] + self.map.shape[0] - 1
+        last_col = self.origin_world_rc[1] + self.map.shape[1] - 1
+        assert self.origin_world_rc[0] <= min_row <= max_row <= last_row
+        assert self.origin_world_rc[1] <= min_col <= max_col <= last_col
         return None
 
     def _count_coverage_hits(self, rows, cols):
@@ -383,6 +394,200 @@ def test_same_ray_endpoint_cell_is_not_counted_as_free_evidence():
     assert observation.free_cells == frozenset()
     assert observation.obstacle_cells == frozenset({ORIGIN_STATE})
     assert observation.conflict_cells == frozenset()
+
+
+def test_opaque_single_ray_matches_off_projection_without_prior_blocker():
+    """Opt-in opacity does not change an unobstructed single-ray frame."""
+    scan = make_scan(1.0)
+
+    baseline = project(scan, laser_x=0.0)
+    opaque = project(
+        scan,
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+    )
+
+    np.testing.assert_array_equal(opaque.local_snap, baseline.local_snap)
+    assert opaque.free_cells == baseline.free_cells
+    assert opaque.obstacle_cells == baseline.obstacle_cells
+    assert opaque.conflict_cells == baseline.conflict_cells
+    assert opaque.occlusion_suppressed_cells == frozenset()
+
+
+def test_opaque_cross_ray_endpoint_blocks_rear_free_and_obstacle_evidence():
+    """A coarse endpoint blocks another ray that continues through its cell."""
+    scan = make_multi_scan(
+        [1.0, 1.8],
+        angle_min=0.10,
+        angle_increment=-0.20,
+    )
+
+    baseline = project(scan, laser_x=0.0)
+    opaque = project(
+        scan,
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+    )
+
+    blocker = (60, 63)
+    assert (60, 64) in baseline.free_cells
+    assert (61, 65) in baseline.obstacle_cells
+    assert blocker in opaque.free_cells
+    assert blocker in opaque.obstacle_cells
+    assert opaque.conflict_cells == frozenset({blocker})
+    assert (60, 64) not in opaque.free_cells
+    assert (61, 65) not in opaque.obstacle_cells
+    assert opaque.occlusion_suppressed_free_cells == frozenset(
+        {(60, 64), (60, 65)}
+    )
+    assert opaque.occlusion_suppressed_obstacle_cells == frozenset(
+        {(61, 65)}
+    )
+
+
+def test_opaque_preserves_free_evidence_before_first_blocker():
+    """Opacity suppresses only evidence strictly behind the blocker cell."""
+    observation = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+        historical_obstacle_cells={(60, 63)},
+    )
+
+    assert {(60, 60), (60, 61), (60, 62), (60, 63)} <= set(
+        observation.free_cells
+    )
+    assert (60, 64) not in observation.free_cells
+    assert observation.obstacle_cells == frozenset()
+
+
+def test_historical_obstacle_can_reverse_before_rear_evidence_resumes():
+    """A historical blocker receives FREE votes while its rear stays opaque."""
+    belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    blocker = (60, 63)
+    rear = (60, 64)
+    obstacle_frame = evidence_observation(obstacle={blocker})
+    apply_evidence_fusion(belief, accumulator, obstacle_frame)
+    apply_evidence_fusion(belief, accumulator, obstacle_frame)
+    assert belief.map[5, 8] == OBSTACLE
+
+    for _index in range(3):
+        observation = project(
+            make_scan(1.8),
+            laser_x=0.0,
+            coarse_occlusion_mode="opaque",
+            historical_obstacle_cells={blocker},
+        )
+        assert blocker in observation.free_cells
+        assert rear not in observation.free_cells
+        apply_evidence_fusion(belief, accumulator, observation)
+
+    assert belief.map[5, 8] == EMPTY
+    future = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+    )
+    assert rear in future.free_cells
+
+
+def test_occlusion_never_erases_historical_rear_free_state():
+    """No current evidence leaves an already-known rear cell unchanged."""
+    belief = BeliefCacheHarness(size=15, origin_world_rc=(55, 55))
+    blocker = (60, 63)
+    rear = (60, 64)
+    belief.map[5, 8] = OBSTACLE
+    belief.map[5, 9] = EMPTY
+    accumulator = BeliefEvidenceAccumulator(
+        named_fusion_config("candidate_a")
+    )
+    observation = project(
+        make_scan(1.8),
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+        historical_obstacle_cells={blocker},
+    )
+
+    assert rear not in observation.free_cells
+    assert rear not in observation.obstacle_cells
+    apply_evidence_fusion(belief, accumulator, observation)
+    assert belief.map[5, 9] == EMPTY
+
+
+def test_visited_agent_cell_is_not_an_occlusion_blocker():
+    """An endpoint quantized onto the robot cell cannot hide all other rays."""
+    observation = project(
+        make_multi_scan([0.08, 1.0], angle_increment=0.0),
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+    )
+
+    assert ORIGIN_STATE in observation.free_cells
+    assert ORIGIN_STATE in observation.obstacle_cells
+    assert (60, 61) in observation.free_cells
+    assert (60, 62) in observation.free_cells
+
+
+def test_ordered_supercover_is_unique_and_includes_corner_side_cells():
+    """Exact diagonal crossings deterministically include both corner sides."""
+    cells = ordered_coarse_ray_cells(
+        0.0,
+        0.0,
+        0.7,
+        0.7,
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_state=ORIGIN_STATE,
+        cell_size=CELL_SIZE,
+    )
+
+    assert cells == (
+        (60, 60),
+        (59, 60),
+        (60, 61),
+        (59, 61),
+        (58, 61),
+        (59, 62),
+        (58, 62),
+    )
+    assert len(cells) == len(set(cells))
+
+
+def test_opaque_corner_supercover_blocker_stops_diagonal_evidence():
+    """A blocker touched at an exact corner occludes the diagonal rear."""
+    scan = make_scan(1.0, angle=math.pi / 4.0)
+    baseline = project(scan, laser_x=0.0)
+    opaque = project(
+        scan,
+        laser_x=0.0,
+        coarse_occlusion_mode="opaque",
+        historical_obstacle_cells={(59, 60)},
+    )
+
+    assert (59, 61) in baseline.free_cells
+    assert (59, 61) not in opaque.free_cells
+    assert (59, 60) in opaque.occlusion_blocker_cells
+
+
+def test_default_occlusion_mode_is_exact_legacy_projection_regression():
+    """Omitting the new parameter remains bit-for-bit equivalent to off."""
+    scan = make_multi_scan([0.5, 1.0, 1.4], angle_increment=0.17)
+
+    implicit = project(scan, laser_x=0.0)
+    explicit = project(
+        scan,
+        laser_x=0.0,
+        coarse_occlusion_mode="off",
+        historical_obstacle_cells={(60, 61), (60, 62)},
+    )
+
+    np.testing.assert_array_equal(implicit.local_snap, explicit.local_snap)
+    assert implicit.free_cells == explicit.free_cells
+    assert implicit.obstacle_cells == explicit.obstacle_cells
+    assert implicit.conflict_cells == explicit.conflict_cells
 
 
 def test_many_free_rays_count_as_one_free_frame():
