@@ -1089,17 +1089,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
 
     def _validate_continuous_parameters(self) -> None:
         """Validate Round 8 invariants and bounded termination settings."""
-        if getattr(self, "fusion_mode", "legacy") not in (
+        fusion_mode = getattr(self, "fusion_mode", "legacy")
+        occlusion_mode = getattr(self, "coarse_occlusion_mode", "off")
+        if fusion_mode not in (
             "legacy",
             "evidence",
         ):
             raise ValueError("belief_fusion_mode must be 'legacy' or 'evidence'")
-        if getattr(self, "coarse_occlusion_mode", "off") not in (
+        if occlusion_mode not in (
             "off",
             "opaque",
         ):
             raise ValueError(
                 "coarse_occlusion_mode must be 'off' or 'opaque'"
+            )
+        if fusion_mode == "legacy" and occlusion_mode == "opaque":
+            raise ValueError(
+                "coarse_occlusion_mode='opaque' requires "
+                "belief_fusion_mode='evidence'"
             )
         if not math.isclose(
             self.cell_size,

@@ -1012,6 +1012,71 @@ def test_continuous_footprint_defaults_define_040_corridor():
     )
 
 
+def valid_continuous_parameter_harness(fusion_mode, occlusion_mode):
+    """Build a valid parameter surface for fusion/occlusion validation."""
+    return types.SimpleNamespace(
+        fusion_mode=fusion_mode,
+        coarse_occlusion_mode=occlusion_mode,
+        cell_size=0.35,
+        step_distance=0.35,
+        diagonal_mode="grid_center",
+        all8_action_mode=True,
+        max_runtime_sec=1.0,
+        motion_clearance_margin=0.25,
+        dynamic_stop_distance=0.25,
+        nominal_min_corridor_width_m=0.40,
+        footprint_radius_m=0.20,
+        longitudinal_extra_margin_m=0.05,
+        dynamic_forward_center_line_extension_m=0.05,
+        minimum_completion_decision_steps=1,
+        minimum_completion_known_cells=1,
+        stagnation_window_steps=1,
+        stagnation_min_known_growth=0,
+        deadlock_window_steps=1,
+        deadlock_maximum_unique_states=1,
+        deadlock_min_known_growth=0,
+        no_safe_action_retries=0,
+        dynamic_stop_recovery_limit=1,
+        local_escape_recovery_limit=1,
+        drive_sensor_cycle_timeout_sec=0.25,
+        commissioning_mode=False,
+        max_steps=1,
+        commissioning_action_idx=-1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fusion_mode", "occlusion_mode"),
+    (
+        ("legacy", "off"),
+        ("evidence", "off"),
+        ("evidence", "opaque"),
+    ),
+)
+def test_supported_fusion_occlusion_combinations_are_accepted(
+    fusion_mode,
+    occlusion_mode,
+):
+    """Legacy default and both evidence projection modes remain valid."""
+    harness = valid_continuous_parameter_harness(
+        fusion_mode,
+        occlusion_mode,
+    )
+
+    RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_legacy_opaque_fusion_combination_is_rejected():
+    """Opaque projection cannot silently alter legacy local snapshots."""
+    harness = valid_continuous_parameter_harness("legacy", "opaque")
+
+    with pytest.raises(
+        ValueError,
+        match="opaque.*requires.*evidence",
+    ):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
 def test_legacy_margin_cannot_conflict_with_footprint_geometry():
     harness = type(
         "FootprintParameterHarness",
