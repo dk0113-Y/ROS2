@@ -225,14 +225,40 @@ true-map coverage。累计 belief 本身可动态扩展，Round 8 的 odom 派�
 实际 policy state 始终由相对 episode 起点的累计 odom 位移量化，二者不一致时记录
 `grid_transition_match=false`，不会强制移动抽象状态。
 
-实机 belief 使用 deployment-only 的 obstacle-dominant fusion。raw `/scan` hit 先通过
-当前连续 odom pose 和 `base_footprint -> laser` 外参得到连续 odom-world 坐标，再以
-episode 首帧 odom 对应 `(60,60)` 为栅格中心锚点量化到 `0.35m` global cell；投影前不会
-把机器人吸附到当前 cell center。命中过的 cell 可从 `EMPTY` 提升为 `OBSTACLE`，且后续
-free ray 不会把它清回 `EMPTY`。每个 decision 记录
-`obstacle_promotions_this_step` 和 `obstacle_promotions_total`；promotion 通过累计 map 的
-dirty-frontier/cache invalidation 接口完成。该融合只在 continuous realcar runner 中调用，
-不改变 DRL 仓库的训练/evaluation `CumulativeBeliefMap` 默认更新语义。
+实机 belief 投影先把 raw `/scan` hit 通过当前连续 odom pose 和
+`base_footprint -> laser` 外参变换到连续 odom-world 坐标，再以 episode 首帧 odom 对应
+`(60,60)` 为栅格中心锚点量化到 `0.35m` global cell；投影前不会把机器人吸附到当前
+cell center。每个 decision 明确输出去重后的全局 `free_cells`、`obstacle_cells` 和
+`conflict_cells`。同一帧的 100 条射线仍只算一个 cell-frame observation；同格同时收到
+free path 和另一端点时记为 conflict，不按射线迭代顺序覆盖。单条射线因粗栅格量化而使
+采样点与自身端点落入同格时，不把端点格另计为 free evidence。
+
+`belief_fusion_mode=legacy` 是 live 默认值，保留原来的 endpoint-dominant categorical
+合并供 A/B 对照；`belief_fusion_mode=evidence` 才启用 global cell evidence accumulator。
+evidence 模式的 `belief_fusion_config` 可选 `candidate_a`、`candidate_b`、`candidate_c`，
+阈值集中记录在配置对象并完整写入 episode JSON。候选使用 distinct decision-frame count、
+evidence margin 和可选 consecutive streak 形成可逆滞回：单个 endpoint 不会永久污染粗格，
+反复 free evidence 可把未访问 OBSTACLE 改回 FREE，而一个孤立 free frame不能擦除已有支持的
+墙格。机器人中心实际访问格始终无条件为 FREE，保护不扩张到邻格。所有部署 transition 都
+通过累计 map 的 bounds、dirty-frontier、obstacle cache、coverage 和 analysis-box hooks；
+不修改 DRL 仓库 `CumulativeBeliefMap`，也不把 SLAM `/map` 输入 policy。
+
+离线回放工具始终运行 legacy 和三个内建候选，不发布 `/cmd_vel`：
+
+```bash
+source /opt/ros/humble/setup.bash
+python3 scripts_realcar/analyze_belief_fusion_replay.py \
+  --bag /absolute/path/to/bag_directory \
+  --episode-json /absolute/path/to/episode.json \
+  --output-dir /absolute/path/to/replay_report
+```
+
+工具以 episode `observation_pose.odom_timestamp` 为 canonical decision time，在默认
+`0.10s` 容差内匹配唯一最近 `/scan`；超出容差或等距歧义会显式失败，不会替换成无关 scan。
+每种模式导出 `belief.npy`、`frontier.npy`、`belief.png`、`metrics.json`，顶层另有
+`comparison.json`、`comparison.csv` 和分面诊断图。若 episode 旁存在保存的 belief，legacy
+会按 world origin 注册后报告复现差异。SLAM 文件不会被读取或用于修改 replay belief；一次
+bag 的结果只能用于候选审查，不能把阈值宣称为已通过正式实车实验验证。
 
 continuous runner 的部署安全层使用显式圆形 safety footprint：
 
