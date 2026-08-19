@@ -19,6 +19,7 @@ from drl_explore_bridge.realcar_action_adapter import (
 from drl_explore_bridge.realcar_conservative_belief import (
     BeliefEvidenceAccumulator,
     ProjectedBeliefObservation,
+    frontier_semantics_snapshot,
     named_fusion_config,
 )
 from drl_explore_bridge import (
@@ -44,6 +45,7 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     RotationFootprintBlocked,
     action_source_for_mode,
     belief_statistics,
+    build_policy_state_with_frontier_semantics,
     capsule_footprint_check,
     drive_sensor_sequence_progress,
     episode_success_for_reason,
@@ -958,10 +960,21 @@ def test_belief_evidence_export_preserves_map_and_metadata(tmp_path):
         metadata["frontier_map_path"],
         allow_pickle=False,
     )
+    exported_effective = np.load(
+        metadata["effective_frontier_map_path"],
+        allow_pickle=False,
+    )
+    exported_observed = np.load(
+        metadata["observed_unclassified_map_path"],
+        allow_pickle=False,
+    )
     assert np.array_equal(exported_belief, map_before)
     assert exported_belief.dtype == map_before.dtype
     assert set(np.unique(exported_belief).tolist()) == {-1, 0, 1}
     assert np.array_equal(exported_frontier, frontier_before)
+    assert np.array_equal(exported_effective, frontier_before)
+    assert exported_effective.dtype == frontier_before.dtype
+    assert not np.any(exported_observed)
     assert metadata["belief_map_shape"] == [2, 3]
     assert metadata["origin_world_rc"] == [-14, 27]
     assert metadata["final_agent_state"] == [-13, 28]
@@ -971,6 +984,63 @@ def test_belief_evidence_export_preserves_map_and_metadata(tmp_path):
     assert (tmp_path / "episode_belief.png").read_bytes().startswith(
         b"\x89PNG\r\n\x1a\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("frontier_mode", "expected_frontier"),
+    (
+        ("legacy", np.array([[255, 0]], dtype=np.uint8)),
+        ("evidence_aware", np.array([[0, 0]], dtype=np.uint8)),
+    ),
+)
+def test_policy_consumes_selected_frontier_semantics(
+    frontier_mode,
+    expected_frontier,
+):
+    """The adapter reads raw frontier in legacy and effective otherwise."""
+    class Belief:
+        map = np.array([[0, -1]], dtype=np.int8)
+        frontier_u8 = np.array([[255, 0]], dtype=np.uint8)
+        origin_world_rc = (0, 0)
+
+        def get_frontier_u8(self, refresh=False):
+            _ = refresh
+            return self.frontier_u8
+
+    class Adapter:
+        consumed_frontier = None
+
+        def build_single_state_tensors(self, cum_map, _agent_state, **_kwargs):
+            self.consumed_frontier = np.array(
+                cum_map.get_frontier_u8(),
+                copy=True,
+            )
+            return {}, {}
+
+    belief = Belief()
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {(0, 1)})
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        frontier_mode,
+    )
+    adapter = Adapter()
+    map_before = belief.map.copy()
+    raw_before = belief.frontier_u8.copy()
+
+    build_policy_state_with_frontier_semantics(
+        adapter,
+        belief,
+        (0, 0),
+        snapshot,
+        frontier_mode,
+        [(0, 0)],
+    )
+
+    assert np.array_equal(adapter.consumed_frontier, expected_frontier)
+    assert np.array_equal(belief.map, map_before)
+    assert np.array_equal(belief.frontier_u8, raw_before)
 
 
 def test_final_trajectory_diagnostics_use_unique_cells():
@@ -1012,11 +1082,16 @@ def test_continuous_footprint_defaults_define_040_corridor():
     )
 
 
-def valid_continuous_parameter_harness(fusion_mode, occlusion_mode):
+def valid_continuous_parameter_harness(
+    fusion_mode,
+    occlusion_mode,
+    frontier_semantics_mode="legacy",
+):
     """Build a valid parameter surface for fusion/occlusion validation."""
     return types.SimpleNamespace(
         fusion_mode=fusion_mode,
         coarse_occlusion_mode=occlusion_mode,
+        frontier_semantics_mode=frontier_semantics_mode,
         cell_size=0.35,
         step_distance=0.35,
         diagonal_mode="grid_center",
@@ -1100,6 +1175,35 @@ def test_unknown_occlusion_mode_is_rejected():
     )
 
     with pytest.raises(ValueError, match="coarse_occlusion_mode must be"):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+@pytest.mark.parametrize(
+    "occlusion_mode",
+    ("off", "opaque", "confirmed_opaque"),
+)
+def test_evidence_aware_frontier_accepts_all_evidence_occlusion_modes(
+    occlusion_mode,
+):
+    """Evidence-aware frontier composes with every evidence projection."""
+    harness = valid_continuous_parameter_harness(
+        "evidence",
+        occlusion_mode,
+        "evidence_aware",
+    )
+
+    RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_evidence_aware_frontier_rejects_legacy_fusion():
+    """Observation semantics cannot be inferred from legacy fusion."""
+    harness = valid_continuous_parameter_harness(
+        "legacy",
+        "off",
+        "evidence_aware",
+    )
+
+    with pytest.raises(ValueError, match="evidence_aware.*requires.*evidence"):
         RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
 
 
@@ -1737,6 +1841,66 @@ def test_frontier_exhaustion_requires_minimum_exploration():
 
 def test_nonzero_frontier_never_reports_exhaustion():
     assert not frontier_exhausted(1, 20, 100, 3, 20)
+
+
+def test_evidence_aware_termination_uses_effective_frontier_count():
+    """Completion follows genuine unexplored frontier, not the raw cache."""
+    harness = types.SimpleNamespace(
+        _completion_enabled=lambda: True,
+        minimum_completion_decision_steps=3,
+        minimum_completion_known_cells=20,
+        stagnation_window_steps=10,
+        stagnation_min_known_growth=1,
+        deadlock_window_steps=8,
+        deadlock_maximum_unique_states=2,
+        deadlock_min_known_growth=1,
+    )
+
+    effective_reason = RealcarPolicyContinuousRunner._belief_termination(
+        harness,
+        3,
+        20,
+        0,
+        [(60, 60)],
+        [20],
+    )
+    raw_reason = RealcarPolicyContinuousRunner._belief_termination(
+        harness,
+        3,
+        20,
+        1,
+        [(60, 60)],
+        [20],
+    )
+
+    assert effective_reason == "frontier_exhausted"
+    assert raw_reason is None
+
+
+def test_observed_unclassified_unknown_prevents_false_frontier_success():
+    """Residual observed ambiguity cannot be reported as normal success."""
+    harness = types.SimpleNamespace(
+        _completion_enabled=lambda: True,
+        minimum_completion_decision_steps=3,
+        minimum_completion_known_cells=20,
+        stagnation_window_steps=10,
+        stagnation_min_known_growth=1,
+        deadlock_window_steps=8,
+        deadlock_maximum_unique_states=2,
+        deadlock_min_known_growth=1,
+    )
+
+    reason = RealcarPolicyContinuousRunner._belief_termination(
+        harness,
+        3,
+        20,
+        0,
+        [(60, 60)],
+        [20],
+        1,
+    )
+
+    assert reason is None
 
 
 def test_known_area_stagnation_requires_full_window():

@@ -31,7 +31,9 @@ from drl_explore_bridge.realcar_conservative_belief import (  # noqa: E402
     apply_evidence_fusion,
     apply_legacy_fusion,
     cumulative_occlusion_cells,
+    frontier_semantics_snapshot,
     named_fusion_config,
+    observed_unclassified_evidence_cells,
     project_scan_to_belief,
     record_traversed_cells_as_free,
     visited_only_local_snap,
@@ -369,16 +371,27 @@ def replay_mode(
     episode: dict[str, Any],
     cumulative_map_type: Any,
     coarse_occlusion_mode: str = "off",
-) -> tuple[Any, np.ndarray, dict[str, Any]]:
+    frontier_semantics_mode: str = "legacy",
+) -> tuple[Any, Any, dict[str, Any]]:
     """Rebuild one final cumulative belief without issuing motion commands."""
     if mode_name != "legacy" and config is None:
         raise ValueError("evidence replay requires a fusion config")
     fusion_mode = "legacy" if config is None else "evidence"
     occlusion_mode = str(coarse_occlusion_mode).strip().lower()
+    frontier_mode = str(frontier_semantics_mode).strip().lower()
     if occlusion_mode not in ("off", "opaque", "confirmed_opaque"):
         raise ValueError(
             "coarse_occlusion_mode must be 'off', 'opaque', or "
             "'confirmed_opaque'"
+        )
+    if frontier_mode not in ("legacy", "evidence_aware"):
+        raise ValueError(
+            "frontier_semantics_mode must be 'legacy' or 'evidence_aware'"
+        )
+    if fusion_mode == "legacy" and frontier_mode == "evidence_aware":
+        raise ValueError(
+            "frontier_semantics_mode='evidence_aware' requires evidence "
+            "fusion"
         )
     cell_size = float(episode.get("cell_size", 0.35))
     if not math.isclose(cell_size, 0.35, rel_tol=0.0, abs_tol=1.0e-9):
@@ -407,6 +420,13 @@ def replay_mode(
     cum_map = None
     known_history: list[int] = []
     frontier_history: list[int] = []
+    raw_frontier_history: list[int] = []
+    effective_frontier_history: list[int] = []
+    observed_unclassified_history: list[int] = []
+    never_observed_history: list[int] = []
+    removed_frontier_history: list[int] = []
+    adjacent_observed_history: list[int] = []
+    frontier_step_history: list[dict[str, int]] = []
     transition_totals = {
         "free_to_obstacle_transition_count": 0,
         "obstacle_to_free_transition_count": 0,
@@ -518,8 +538,49 @@ def replay_mode(
         known_history.append(
             int(np.count_nonzero(np.asarray(cum_map.map) != INVISIBLE))
         )
-        frontier_history.append(
-            int(np.count_nonzero(cum_map.get_frontier_u8() > 0))
+        frontier_snapshot = frontier_semantics_snapshot(
+            cum_map,
+            accumulator,
+            frontier_mode,
+        )
+        fs = frontier_snapshot
+        raw_frontier_history.append(fs.raw_frontier_count)
+        effective_frontier_history.append(
+            fs.effective_frontier_count
+        )
+        observed_unclassified_history.append(
+            fs.observed_unclassified_unknown_count
+        )
+        never_observed_history.append(
+            fs.never_observed_unknown_count
+        )
+        removed_frontier_history.append(
+            fs.frontier_removed_by_observed_unknown_count
+        )
+        adjacent_observed_history.append(
+            fs.frontier_adjacent_observed_unclassified_count
+        )
+        frontier_history.append(fs.effective_frontier_count)
+        frontier_step_history.append(
+            {
+                "step_id": int(decision.step_id),
+                "raw_frontier_count": fs.raw_frontier_count,
+                "effective_frontier_count": (
+                    fs.effective_frontier_count
+                ),
+                "observed_unclassified_unknown_count": (
+                    fs.observed_unclassified_unknown_count
+                ),
+                "never_observed_unknown_count": (
+                    fs.never_observed_unknown_count
+                ),
+                "frontier_removed_by_observed_unknown_count": (
+                    fs.frontier_removed_by_observed_unknown_count
+                ),
+                "frontier_adjacent_observed_unclassified_count": (
+                    fs.frontier_adjacent_observed_unclassified_count
+                ),
+            }
         )
 
     if cum_map is None:
@@ -530,7 +591,12 @@ def replay_mode(
         final_corrections.corrected_from_obstacle
     )
     belief = np.asarray(cum_map.map)
-    frontier = np.array(cum_map.get_frontier_u8(), copy=True)
+    frontier_snapshot = frontier_semantics_snapshot(
+        cum_map,
+        accumulator,
+        frontier_mode,
+    )
+    fs = frontier_snapshot
     unknown_count = int(np.count_nonzero(belief == INVISIBLE))
     free_count = int(np.count_nonzero(belief == EMPTY))
     obstacle_count = int(np.count_nonzero(belief == OBSTACLE))
@@ -540,6 +606,7 @@ def replay_mode(
         "fusion_mode": fusion_mode,
         "fusion_config": config.as_dict() if config is not None else None,
         "coarse_occlusion_mode": occlusion_mode,
+        "frontier_semantics_mode": frontier_mode,
         "unknown_count": unknown_count,
         "free_count": free_count,
         "obstacle_count": obstacle_count,
@@ -550,9 +617,45 @@ def replay_mode(
         "obstacle_fraction_of_known": (
             float(obstacle_count) / float(known_count) if known_count else 0.0
         ),
-        "frontier_count": int(np.count_nonzero(frontier > 0)),
+        "frontier_count": fs.effective_frontier_count,
+        "raw_frontier_count": fs.raw_frontier_count,
+        "effective_frontier_count": fs.effective_frontier_count,
+        "observed_unclassified_unknown_count": (
+            fs.observed_unclassified_unknown_count
+        ),
+        "never_observed_unknown_count": (
+            fs.never_observed_unknown_count
+        ),
+        "frontier_removed_by_observed_unknown_count": (
+            fs.frontier_removed_by_observed_unknown_count
+        ),
+        "frontier_adjacent_observed_unclassified_count": (
+            fs.frontier_adjacent_observed_unclassified_count
+        ),
+        "effective_frontier_zero_with_observed_unclassified": bool(
+            fs.effective_frontier_count == 0
+            and fs.observed_unclassified_unknown_count > 0
+        ),
         "known_area_history": known_history,
         "frontier_count_history": frontier_history,
+        "raw_frontier_count_history": raw_frontier_history,
+        "effective_frontier_count_history": effective_frontier_history,
+        "observed_unclassified_unknown_count_history": (
+            observed_unclassified_history
+        ),
+        "never_observed_unknown_count_history": never_observed_history,
+        "frontier_removed_by_observed_unknown_count_history": (
+            removed_frontier_history
+        ),
+        "frontier_adjacent_observed_unclassified_count_history": (
+            adjacent_observed_history
+        ),
+        "frontier_step_history": frontier_step_history,
+        "observed_unclassified_evidence_cells": (
+            observed_unclassified_evidence_cells(cum_map, accumulator)
+            if accumulator is not None
+            else []
+        ),
         "occlusion_step_history": occlusion_step_history,
         "origin_world_rc": [int(value) for value in cum_map.origin_world_rc],
         "belief_shape": [int(value) for value in belief.shape],
@@ -569,7 +672,7 @@ def replay_mode(
         **transition_totals,
         **_trajectory_obstacle_diagnostics(cum_map, trajectory),
     }
-    return cum_map, frontier, metrics
+    return cum_map, frontier_snapshot, metrics
 
 
 def _artifact_path(episode_path: Path, raw_path: Any) -> Optional[Path]:
@@ -647,7 +750,7 @@ def export_mode(
     output_directory: Path,
     mode_name: str,
     cum_map: Any,
-    frontier: np.ndarray,
+    frontier_snapshot: Any,
     metrics: dict[str, Any],
     trajectory: Sequence[tuple[int, int]],
 ) -> Path:
@@ -659,10 +762,24 @@ def export_mode(
         np.asarray(cum_map.map),
         allow_pickle=False,
     )
-    np.save(mode_directory / "frontier.npy", frontier, allow_pickle=False)
+    np.save(
+        mode_directory / "frontier.npy",
+        frontier_snapshot.raw_frontier_u8,
+        allow_pickle=False,
+    )
+    np.save(
+        mode_directory / "effective_frontier.npy",
+        frontier_snapshot.effective_frontier_u8,
+        allow_pickle=False,
+    )
+    np.save(
+        mode_directory / "observed_unclassified.npy",
+        frontier_snapshot.observed_unclassified_mask,
+        allow_pickle=False,
+    )
     image = belief_evidence_image(
         np.asarray(cum_map.map),
-        frontier,
+        frontier_snapshot.raw_frontier_u8,
         tuple(int(value) for value in cum_map.origin_world_rc),
         trajectory,
     )
@@ -742,18 +859,28 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         configs.append(config)
     requested_occlusion_modes = args.coarse_occlusion_mode or ["off"]
     occlusion_modes = list(dict.fromkeys(requested_occlusion_modes))
+    requested_frontier_modes = args.frontier_semantics_mode or ["legacy"]
+    frontier_modes = list(dict.fromkeys(requested_frontier_modes))
     mode_specs: list[
-        tuple[str, Optional[BeliefFusionConfig], str]
-    ] = [("legacy", None, "off")]
+        tuple[str, Optional[BeliefFusionConfig], str, str]
+    ] = [("legacy", None, "off", "legacy")]
     multiple_projection_modes = len(occlusion_modes) > 1
     for config in configs:
         for occlusion_mode in occlusion_modes:
-            label = (
+            base_label = (
                 f"{config.name}_{occlusion_mode}"
                 if multiple_projection_modes or occlusion_mode != "off"
                 else config.name
             )
-            mode_specs.append((label, config, occlusion_mode))
+            for frontier_mode in frontier_modes:
+                label = (
+                    base_label
+                    if frontier_mode == "legacy"
+                    else f"{base_label}_frontier_evidence_aware"
+                )
+                mode_specs.append(
+                    (label, config, occlusion_mode, frontier_mode)
+                )
     cumulative_map_type = _load_cumulative_map_type(
         args.drl_repository.expanduser().resolve()
     )
@@ -764,14 +891,15 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     legacy_map = None
     replay_maps: dict[str, Any] = {}
 
-    for mode_name, config, occlusion_mode in mode_specs:
-        cum_map, frontier, metrics = replay_mode(
+    for mode_name, config, occlusion_mode, frontier_mode in mode_specs:
+        cum_map, frontier_snapshot, metrics = replay_mode(
             mode_name,
             config,
             matches,
             episode,
             cumulative_map_type,
             coarse_occlusion_mode=occlusion_mode,
+            frontier_semantics_mode=frontier_mode,
         )
         if mode_name == "legacy":
             legacy_map = cum_map
@@ -780,7 +908,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             output_directory,
             mode_name,
             cum_map,
-            frontier,
+            frontier_snapshot,
             metrics,
             trajectory,
         )
@@ -803,10 +931,11 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             "setting or any custom evidence-fusion thresholds."
         ),
         (
-            "Offline occlusion replay proves only LaserScan-to-belief/frontier "
-            "counterfactual behavior under recorded poses and scans; it cannot "
-            "prove new policy actions, safety outcomes, motion, observations, "
-            "or a reduced safety-intervention rate."
+            "Offline replay proves only recorded observation, categorical "
+            "belief, occlusion, and frontier semantics; it cannot prove new "
+            "closed-loop policy actions, coverage efficiency, oscillation, "
+            "safety outcomes, motion, future observations, or a reduced "
+            "safety-intervention rate."
         ),
     ]
     for missing_key in (
@@ -840,7 +969,8 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             key
             for row in comparison_rows
             for key in row
-            if key not in ("known_area_history", "frontier_count_history")
+            if not key.endswith("_history")
+            and key != "observed_unclassified_evidence_cells"
         }
     )
     with (output_directory / "comparison.csv").open(
@@ -886,6 +1016,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "additional named candidate or JSON config; built-in candidate_a, "
             "candidate_b, and candidate_c always run"
+        ),
+    )
+    parser.add_argument(
+        "--frontier-semantics-mode",
+        action="append",
+        choices=("legacy", "evidence_aware"),
+        default=None,
+        help=(
+            "policy frontier semantics to replay; repeat for both modes "
+            "(default: legacy)"
         ),
     )
     parser.add_argument(

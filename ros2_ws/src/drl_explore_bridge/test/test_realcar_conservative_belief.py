@@ -16,6 +16,7 @@ from drl_explore_bridge.realcar_conservative_belief import (
     apply_evidence_fusion,
     apply_legacy_fusion,
     cumulative_occlusion_cells,
+    frontier_semantics_snapshot,
     named_fusion_config,
     ordered_coarse_ray_cells,
     project_scan_to_belief,
@@ -790,6 +791,174 @@ def evidence_observation(*, free=(), obstacle=(), conflict=()):
         free_cells=frozenset(free),
         conflict_cells=frozenset(conflict),
     )
+
+
+def semantic_corridor_belief(left, center, right):
+    """Create a bounded three-cell corridor for frontier semantics tests."""
+    belief = BeliefCacheHarness()
+    belief.map.fill(OBSTACLE)
+    belief.map[2, 1:4] = np.asarray([left, center, right], dtype=np.int8)
+    belief.visit_count.fill(0)
+    belief.frontier_u8 = frontier_mask(belief.map)
+    return belief
+
+
+def test_never_observed_unknown_keeps_adjacent_free_frontier():
+    """Case A: genuine unseen space remains an exploration frontier."""
+    belief = semantic_corridor_belief(OBSTACLE, EMPTY, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert snapshot.raw_frontier_u8[2, 2] == 255
+    assert snapshot.effective_frontier_u8[2, 2] == 255
+    assert snapshot.never_observed_unknown_mask[2, 3]
+
+
+def test_observed_unclassified_unknown_alone_removes_frontier():
+    """Case B: observed ambiguity alone is not unexplored space."""
+    belief = semantic_corridor_belief(OBSTACLE, EMPTY, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {(60, 61)})
+    map_before = belief.map.copy()
+    raw_before = belief.frontier_u8.copy()
+
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert snapshot.raw_frontier_u8[2, 2] == 255
+    assert snapshot.effective_frontier_u8[2, 2] == 0
+    assert snapshot.frontier_removed_by_observed_unknown_count == 1
+    assert snapshot.frontier_adjacent_observed_unclassified_count == 1
+    assert np.array_equal(belief.map, map_before)
+    assert np.array_equal(belief.frontier_u8, raw_before)
+
+
+def test_mixed_observed_and_never_unknown_keeps_frontier():
+    """Case C: one genuinely unseen neighbor is sufficient."""
+    belief = semantic_corridor_belief(INVISIBLE, EMPTY, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {(60, 59)})
+
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert snapshot.observed_unclassified_mask[2, 1]
+    assert snapshot.never_observed_unknown_mask[2, 3]
+    assert snapshot.effective_frontier_u8[2, 2] == 255
+
+
+def test_frontier_advances_after_ambiguous_cell_becomes_free():
+    """Case D: supported FREE evidence advances toward unseen space."""
+    belief = semantic_corridor_belief(EMPTY, INVISIBLE, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {ORIGIN_STATE})
+    frame = evidence_observation(free={ORIGIN_STATE})
+
+    apply_evidence_fusion(belief, accumulator, frame)
+    apply_evidence_fusion(belief, accumulator, frame)
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert belief.map[2, 2] == EMPTY
+    assert snapshot.effective_frontier_u8[2, 1] == 0
+    assert snapshot.effective_frontier_u8[2, 2] == 255
+
+
+def test_frontier_does_not_cross_ambiguous_cell_that_becomes_obstacle():
+    """Case E: supported OBSTACLE evidence blocks frontier propagation."""
+    belief = semantic_corridor_belief(EMPTY, INVISIBLE, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {ORIGIN_STATE})
+    frame = evidence_observation(obstacle={ORIGIN_STATE})
+
+    apply_evidence_fusion(belief, accumulator, frame)
+    apply_evidence_fusion(belief, accumulator, frame)
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert belief.map[2, 2] == OBSTACLE
+    assert not np.any(snapshot.effective_frontier_u8)
+
+
+def test_occlusion_suppressed_cell_is_not_observed():
+    """Case F: suppression metadata never enters the accumulator."""
+    belief = semantic_corridor_belief(EMPTY, INVISIBLE, INVISIBLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    rear = (60, 61)
+    observation = ProjectedBeliefObservation(
+        local_snap=np.full((3, 3), INVISIBLE, dtype=np.int8),
+        obstacle_cells=frozenset(),
+        occlusion_suppressed_obstacle_cells=frozenset({rear}),
+    )
+
+    apply_evidence_fusion(belief, accumulator, observation)
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+
+    assert not accumulator.has_accepted_evidence(rear)
+    assert snapshot.never_observed_unknown_mask[2, 3]
+    assert not snapshot.observed_unclassified_mask[2, 3]
+
+
+def test_conflict_only_cell_is_observed_but_unclassified():
+    """Case G: repeated conflict remains categorical UNKNOWN but observed."""
+    belief = semantic_corridor_belief(EMPTY, INVISIBLE, OBSTACLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+
+    for _index in range(10):
+        apply_evidence_fusion(
+            belief,
+            accumulator,
+            evidence_observation(conflict={ORIGIN_STATE}),
+        )
+    snapshot = frontier_semantics_snapshot(
+        belief,
+        accumulator,
+        "evidence_aware",
+    )
+    state = accumulator.state_for(ORIGIN_STATE)
+
+    assert state.free_frame_count == 0
+    assert state.obstacle_frame_count == 0
+    assert state.conflict_frame_count == 10
+    assert belief.map[2, 2] == INVISIBLE
+    assert snapshot.observed_unclassified_mask[2, 2]
+    assert not snapshot.never_observed_unknown_mask[2, 2]
+
+
+def test_legacy_frontier_semantics_is_exact_raw_regression():
+    """Case H: the default mode returns the unfiltered core frontier."""
+    belief = semantic_corridor_belief(EMPTY, INVISIBLE, OBSTACLE)
+    accumulator = BeliefEvidenceAccumulator(named_fusion_config("candidate_a"))
+    accumulator.observe((), (), {ORIGIN_STATE})
+    raw_before = belief.frontier_u8.copy()
+
+    snapshot = frontier_semantics_snapshot(belief, accumulator)
+
+    assert snapshot.effective_frontier_u8.dtype == raw_before.dtype
+    assert snapshot.effective_frontier_u8.shape == raw_before.shape
+    assert np.array_equal(snapshot.effective_frontier_u8, raw_before)
+    assert snapshot.frontier_removed_by_observed_unknown_count == 0
 
 
 def test_single_obstacle_frame_does_not_poison_coarse_cell():

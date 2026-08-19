@@ -153,6 +153,22 @@ class FusionStepStats:
     obstacle_to_free_transitions_this_step: int
 
 
+@dataclass(frozen=True)
+class FrontierSemanticsSnapshot:
+    """Read-only deployment frontier masks and observation diagnostics."""
+
+    raw_frontier_u8: np.ndarray
+    effective_frontier_u8: np.ndarray
+    observed_unclassified_mask: np.ndarray
+    never_observed_unknown_mask: np.ndarray
+    raw_frontier_count: int
+    effective_frontier_count: int
+    observed_unclassified_unknown_count: int
+    never_observed_unknown_count: int
+    frontier_removed_by_observed_unknown_count: int
+    frontier_adjacent_observed_unclassified_count: int
+
+
 class BeliefEvidenceAccumulator:
     """Fuse frame-deduplicated global evidence with explicit hysteresis."""
 
@@ -165,6 +181,31 @@ class BeliefEvidenceAccumulator:
         """Return the mutable evidence state for a normalized global cell."""
         normalized = (int(cell[0]), int(cell[1]))
         return self.cells.setdefault(normalized, CellEvidenceState())
+
+    def has_accepted_evidence(self, cell: tuple[int, int]) -> bool:
+        """Return whether fusion accepted any evidence for one world cell."""
+        normalized = (int(cell[0]), int(cell[1]))
+        state = self.cells.get(normalized)
+        return bool(
+            state is not None
+            and (
+                state.free_frame_count
+                + state.obstacle_frame_count
+                + state.conflict_frame_count
+            ) > 0
+        )
+
+    def ever_observed_cells(self) -> frozenset[tuple[int, int]]:
+        """Return world cells with at least one accepted fusion observation."""
+        return frozenset(
+            cell
+            for cell, state in self.cells.items()
+            if (
+                state.free_frame_count
+                + state.obstacle_frame_count
+                + state.conflict_frame_count
+            ) > 0
+        )
 
     def observe(
         self,
@@ -220,6 +261,134 @@ class BeliefEvidenceAccumulator:
         if free_ready == obstacle_ready:
             return None
         return EMPTY if free_ready else OBSTACLE
+
+
+def _orthogonally_adjacent_mask(mask: np.ndarray) -> np.ndarray:
+    """Return cells sharing a four-connected edge with the input mask."""
+    source = np.asarray(mask, dtype=bool)
+    adjacent = np.zeros_like(source, dtype=bool)
+    adjacent[1:, :] |= source[:-1, :]
+    adjacent[:-1, :] |= source[1:, :]
+    adjacent[:, 1:] |= source[:, :-1]
+    adjacent[:, :-1] |= source[:, 1:]
+    return adjacent
+
+
+def frontier_semantics_snapshot(
+    cum_map: Any,
+    accumulator: Optional[BeliefEvidenceAccumulator],
+    frontier_semantics_mode: str = "legacy",
+) -> FrontierSemanticsSnapshot:
+    """Filter the core frontier without mutating belief or core caches."""
+    mode = str(frontier_semantics_mode).strip().lower()
+    if mode not in ("legacy", "evidence_aware"):
+        raise ValueError(
+            "frontier_semantics_mode must be 'legacy' or 'evidence_aware'"
+        )
+    if mode == "evidence_aware" and accumulator is None:
+        raise ValueError(
+            "frontier_semantics_mode='evidence_aware' requires evidence "
+            "fusion"
+        )
+
+    belief = np.asarray(cum_map.map)
+    raw_source = getattr(cum_map, "frontier_u8", None)
+    if raw_source is None:
+        raw_source = cum_map.get_frontier_u8()
+    raw = np.asarray(raw_source)
+    if belief.ndim != 2:
+        raise ValueError("cum_map.map must be two-dimensional")
+    if raw.shape != belief.shape:
+        raise ValueError(
+            "raw frontier shape must match cumulative belief shape: "
+            f"{raw.shape} != {belief.shape}"
+        )
+
+    observed_unclassified = np.zeros_like(belief, dtype=bool)
+    if accumulator is not None:
+        origin_row, origin_col = (
+            int(cum_map.origin_world_rc[0]),
+            int(cum_map.origin_world_rc[1]),
+        )
+        height, width = int(belief.shape[0]), int(belief.shape[1])
+        for world_row, world_col in accumulator.ever_observed_cells():
+            array_row = int(world_row) - origin_row
+            array_col = int(world_col) - origin_col
+            if (
+                0 <= array_row < height
+                and 0 <= array_col < width
+                and belief[array_row, array_col] == INVISIBLE
+            ):
+                observed_unclassified[array_row, array_col] = True
+
+    unknown = belief == INVISIBLE
+    never_observed_unknown = unknown & (~observed_unclassified)
+    raw_bool = raw > 0
+    evidence_aware_bool = raw_bool & _orthogonally_adjacent_mask(
+        never_observed_unknown
+    )
+    effective_bool = raw_bool if mode == "legacy" else evidence_aware_bool
+    effective = np.where(effective_bool, raw, np.zeros((), dtype=raw.dtype))
+    effective = np.asarray(effective, dtype=raw.dtype)
+
+    raw_count = int(np.count_nonzero(raw_bool))
+    effective_count = int(np.count_nonzero(effective_bool))
+    adjacent_observed = observed_unclassified & _orthogonally_adjacent_mask(
+        raw_bool
+    )
+    return FrontierSemanticsSnapshot(
+        raw_frontier_u8=np.array(raw, copy=True),
+        effective_frontier_u8=np.array(effective, copy=True),
+        observed_unclassified_mask=observed_unclassified,
+        never_observed_unknown_mask=never_observed_unknown,
+        raw_frontier_count=raw_count,
+        effective_frontier_count=effective_count,
+        observed_unclassified_unknown_count=int(
+            np.count_nonzero(observed_unclassified)
+        ),
+        never_observed_unknown_count=int(
+            np.count_nonzero(never_observed_unknown)
+        ),
+        frontier_removed_by_observed_unknown_count=(
+            raw_count - effective_count
+        ),
+        frontier_adjacent_observed_unclassified_count=int(
+            np.count_nonzero(adjacent_observed)
+        ),
+    )
+
+
+def observed_unclassified_evidence_cells(
+    cum_map: Any,
+    accumulator: BeliefEvidenceAccumulator,
+) -> list[dict[str, int]]:
+    """List unresolved observed world cells with their evidence counts."""
+    belief = np.asarray(cum_map.map)
+    origin_row, origin_col = (
+        int(cum_map.origin_world_rc[0]),
+        int(cum_map.origin_world_rc[1]),
+    )
+    unresolved: list[dict[str, int]] = []
+    for world_row, world_col in sorted(accumulator.ever_observed_cells()):
+        array_row = int(world_row) - origin_row
+        array_col = int(world_col) - origin_col
+        if not (
+            0 <= array_row < belief.shape[0]
+            and 0 <= array_col < belief.shape[1]
+            and belief[array_row, array_col] == INVISIBLE
+        ):
+            continue
+        state = accumulator.cells[(world_row, world_col)]
+        unresolved.append(
+            {
+                "row": int(world_row),
+                "col": int(world_col),
+                "free_frame_count": int(state.free_frame_count),
+                "obstacle_frame_count": int(state.obstacle_frame_count),
+                "conflict_frame_count": int(state.conflict_frame_count),
+            }
+        )
+    return unresolved
 
 
 @dataclass(frozen=True)

@@ -264,6 +264,43 @@ authoritative FREE。遮挡只抑制当前帧 evidence，不会把历史 FREE/OB
 episode 顶层和每步 JSON 会记录 `coarse_occlusion_mode`，并记录 blocker、suppressed FREE、
 suppressed OBSTACLE 与去重 suppressed cells 的 per-step counts 和 episode totals。
 
+`frontier_semantics_mode` 独立控制 deployment policy 对 frontier 的解释：
+
+- `legacy`：默认值，完全沿用 core frontier；任意 `EMPTY` cell 只要按 core 的 4 邻接接触
+  `INVISIBLE` 就是 frontier。
+- `evidence_aware`：只允许与 `belief_fusion_mode=evidence` 组合。它保留 raw core frontier，
+  但要求 frontier cell 至少按同一 4 邻接接触一个从未进入 evidence accumulator 的
+  `INVISIBLE` cell，才进入 policy-effective frontier。
+
+这里 `UNKNOWN occupancy` 不等于 `UNEXPLORED`。FREE、OBSTACLE 或 conflict evidence 只要在
+occlusion filtering 之后真正传给 `BeliefEvidenceAccumulator.observe()`，该 policy cell 就是
+observed。尚未达到 candidate hysteresis 的 observed cell 继续在 categorical belief 中保持
+`INVISIBLE=-1`，不增加 model channel，也不修改 checkpoint；但在 `evidence_aware` 下，它不能
+单独制造 exploration frontier。被 occlusion suppression 拒绝的候选没有进入 accumulator，
+因此仍是 never-observed。没有额外的 ambiguity frame threshold。
+
+core `cum_map.map`、`frontier_u8` 和 raw frontier cache 均不被过滤器修改。continuous runner
+在调用 DRL `StateTensorAdapter.build_single_state_tensors()` 前建立一个只读 belief view；该 view
+只覆盖 `get_frontier_u8()`，所以 `SharedSemanticLayer.analyze()` 及后续 value/advantage input
+实际消费 effective frontier，而 categorical belief、dtype、shape、channel order 和 visit state
+保持不变。legacy 模式继续把原始 `cum_map` 直接交给 adapter。
+
+每步及 episode JSON 保留 `frontier_count`，并新增 `raw_frontier_count`、
+`effective_frontier_count`、`observed_unclassified_unknown_count`、
+`never_observed_unknown_count`、`frontier_removed_by_observed_unknown_count` 和
+`frontier_adjacent_observed_unclassified_count`。在 evidence-aware 模式，`frontier_count` 等于
+`effective_frontier_count`，completion 的 `frontier_exhausted` 也使用该 policy-effective count；
+stagnation/deadlock 的窗口和阈值不变。当 effective frontier 为零但仍有 observed-unclassified
+cells 时，`effective_frontier_zero_with_observed_unclassified=true` 明确记录残余 categorical
+uncertainty，并阻止把该状态立即报告为正常 `frontier_exhausted` 成功；runner 继续受原有
+stagnation、deadlock 和 hard limits 约束。legacy 模式的 completion 仍使用 raw frontier。
+
+最终 `*_belief.npy`、`*_belief.png`、`*_frontier.npy` 语义保持不变，其中
+`*_frontier.npy` 仍是 raw/core frontier；另外导出 `*_effective_frontier.npy` 与
+`*_observed_unclassified.npy`。这些诊断文件不会反向输入 policy。SLAM `/map` 仍只用于独立
+评估/记录，从不进入 policy。`candidate_a` thresholds、`confirmed_opaque` blocker、cell size、
+动作步长、footprint/clearance、dynamic-stop 和 local-escape 均未因该模式改变。
+
 离线回放工具始终运行 legacy 和三个内建候选，不发布 `/cmd_vel`：
 
 ```bash
@@ -274,21 +311,26 @@ python3 scripts_realcar/analyze_belief_fusion_replay.py \
   --output-dir /absolute/path/to/replay_report \
   --coarse-occlusion-mode off \
   --coarse-occlusion-mode opaque \
-  --coarse-occlusion-mode confirmed_opaque
+  --coarse-occlusion-mode confirmed_opaque \
+  --frontier-semantics-mode legacy \
+  --frontier-semantics-mode evidence_aware
 ```
 
 工具以 episode `observation_pose.odom_timestamp` 为 canonical decision time，在默认
 `0.10s` 容差内匹配唯一最近 `/scan`；超出容差或等距歧义会显式失败，不会替换成无关 scan。
-每种模式导出 `belief.npy`、`frontier.npy`、`belief.png`、`metrics.json`，顶层另有
+每种模式导出 `belief.npy`、raw `frontier.npy`、`effective_frontier.npy`、
+`observed_unclassified.npy`、`belief.png`、`metrics.json`，顶层另有
 `comparison.json`、`comparison.csv` 和分面诊断图。若 episode 旁存在保存的 belief，每个
 replay mode 都会按 world origin 注册后报告 `mismatch_count`/`match_fraction`；原有
 `legacy_saved_belief_comparison` 字段继续保留。每个 mode 还记录 known/frontier histories、
+raw/effective frontier 与 observed/never-observed histories、逐步 frontier removal、
 transition/conflict totals 和逐步 occlusion suppression 摘要。SLAM 文件不会被读取或用于
 修改 replay belief。
 
 离线 occlusion replay 只能证明 recorded poses/scans 下的
 `LaserScan -> belief/frontier` counterfactual behavior。它不能证明新的 belief 会产生新的
-policy action、安全结果、运动和后续观测，也不能据此声称 safety intervention rate 已降低。
+closed-loop policy action、更高 coverage efficiency、更少 oscillation、安全结果、运动和
+后续观测，也不能据此声称 safety intervention rate 已降低。
 
 continuous runner 的部署安全层使用显式圆形 safety footprint：
 
@@ -407,13 +449,16 @@ ros2 run drl_explore_bridge realcar_policy_continuous_runner_node --ros-args \
   -p max_steps:=5 \
   -p belief_fusion_mode:=evidence \
   -p belief_fusion_config:=candidate_a \
-  -p coarse_occlusion_mode:=off
+  -p coarse_occlusion_mode:=off \
+  -p frontier_semantics_mode:=legacy
 ```
 
 将最后一项显式改为 `coarse_occlusion_mode:=opaque` 可复现 endpoint + confirmed obstacle
 blocker 的 v1；改为 `coarse_occlusion_mode:=confirmed_opaque` 则只允许正式分类的累计
 OBSTACLE cells 阻挡 LOS。两者都要求 `belief_fusion_mode:=evidence`；未指定时始终为 `off`，
 legacy fusion 也只支持 `off`。
+将最后一项显式改为 `frontier_semantics_mode:=evidence_aware` 才启用 observed/unobserved
+frontier 过滤；该组合要求 `belief_fusion_mode:=evidence`。
 
 `execute=false` 只验证 loop、belief、inference、sensor barrier、termination plumbing 和
 JSON logging；静止机器人不会提供真实运动后的状态变化，因此不能证明连续自主探索。

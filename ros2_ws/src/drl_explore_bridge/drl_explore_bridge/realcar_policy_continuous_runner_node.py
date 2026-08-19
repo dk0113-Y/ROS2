@@ -26,13 +26,16 @@ from sensor_msgs.msg import LaserScan
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
 from drl_explore_bridge.realcar_conservative_belief import (
     BeliefEvidenceAccumulator,
+    FrontierSemanticsSnapshot,
     OBSTACLE,
     ProjectedBeliefObservation,
     apply_evidence_fusion,
     apply_legacy_fusion,
     cumulative_occlusion_cells,
     final_belief_cell_counts,
+    frontier_semantics_snapshot,
     named_fusion_config,
+    observed_unclassified_evidence_cells,
     project_scan_to_belief,
     record_traversed_cells_as_free,
     visited_only_local_snap,
@@ -231,6 +234,75 @@ def drive_sensor_sequence_progress(
     scan_advanced = scan_sequence > previous_scan_sequence
     odom_advanced = odom_sequence > previous_odom_sequence
     return scan_advanced, odom_advanced, scan_advanced and odom_advanced
+
+
+class PolicyFrontierBeliefView:
+    """Delegate belief reads while overriding only the policy frontier."""
+
+    def __init__(self, cum_map: Any, frontier_u8: np.ndarray):
+        """Create a non-mutating view with one explicit frontier mask."""
+        frontier = np.asarray(frontier_u8)
+        if frontier.shape != np.asarray(cum_map.map).shape:
+            raise ValueError(
+                "policy frontier shape must match cumulative belief shape"
+            )
+        self._cum_map = cum_map
+        self._frontier_u8 = np.array(frontier, copy=True)
+
+    @property
+    def frontier_u8(self) -> np.ndarray:
+        """Expose the selected frontier without touching the core cache."""
+        return self._frontier_u8
+
+    def get_frontier_u8(self, refresh: bool = False) -> np.ndarray:
+        """Return the selected policy frontier for every read path."""
+        _ = refresh
+        return self._frontier_u8
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate categorical belief, topology, and visit state reads."""
+        return getattr(self._cum_map, name)
+
+
+def policy_belief_view(
+    cum_map: Any,
+    frontier_snapshot: FrontierSemanticsSnapshot,
+    frontier_semantics_mode: str,
+) -> Any:
+    """Select the exact cumulative-map view consumed by the DRL adapter."""
+    mode = str(frontier_semantics_mode).strip().lower()
+    if mode == "legacy":
+        return cum_map
+    if mode == "evidence_aware":
+        return PolicyFrontierBeliefView(
+            cum_map,
+            frontier_snapshot.effective_frontier_u8,
+        )
+    raise ValueError(
+        "frontier_semantics_mode must be 'legacy' or 'evidence_aware'"
+    )
+
+
+def build_policy_state_with_frontier_semantics(
+    adapter: Any,
+    cum_map: Any,
+    agent_state: tuple[int, int],
+    frontier_snapshot: FrontierSemanticsSnapshot,
+    frontier_semantics_mode: str,
+    recent_positions: Sequence[tuple[int, int]],
+) -> tuple[Any, Any]:
+    """Build model state from the selected raw or effective frontier."""
+    policy_map = policy_belief_view(
+        cum_map,
+        frontier_snapshot,
+        frontier_semantics_mode,
+    )
+    return adapter.build_single_state_tensors(
+        policy_map,
+        agent_state,
+        recent_trajectory_positions=recent_positions,
+        return_state_meta=True,
+    )
 
 
 def belief_statistics(cum_map: Any) -> tuple[int, int]:
@@ -564,13 +636,19 @@ def export_belief_evidence(
     cum_map: Any,
     result_path: Path,
     trajectory_world_rc: Sequence[tuple[int, int]],
+    accumulator: Optional[BeliefEvidenceAccumulator] = None,
+    frontier_semantics_mode: str = "legacy",
 ) -> dict[str, Any]:
     """Export final read-only belief evidence beside an episode JSON path."""
     belief = np.array(cum_map.map, copy=True)
-    frontier_source = getattr(cum_map, "frontier_u8", None)
-    if frontier_source is None:
-        frontier_source = cum_map.get_frontier_u8()
-    frontier = np.array(frontier_source, copy=True)
+    frontier_snapshot = frontier_semantics_snapshot(
+        cum_map,
+        accumulator,
+        frontier_semantics_mode,
+    )
+    frontier = frontier_snapshot.raw_frontier_u8
+    effective_frontier = frontier_snapshot.effective_frontier_u8
+    observed_unclassified = frontier_snapshot.observed_unclassified_mask
     origin_world_rc = tuple(int(value) for value in cum_map.origin_world_rc)
     trajectory = [
         (int(state[0]), int(state[1])) for state in trajectory_world_rc
@@ -585,6 +663,12 @@ def export_belief_evidence(
 
     belief_path = result_path.with_name(f"{result_path.stem}_belief.npy")
     frontier_path = result_path.with_name(f"{result_path.stem}_frontier.npy")
+    effective_frontier_path = result_path.with_name(
+        f"{result_path.stem}_effective_frontier.npy"
+    )
+    observed_unclassified_path = result_path.with_name(
+        f"{result_path.stem}_observed_unclassified.npy"
+    )
     png_path = result_path.with_name(f"{result_path.stem}_belief.png")
     created_paths: list[Path] = []
     try:
@@ -594,6 +678,12 @@ def export_belief_evidence(
         with frontier_path.open("xb") as output:
             created_paths.append(frontier_path)
             np.save(output, frontier, allow_pickle=False)
+        with effective_frontier_path.open("xb") as output:
+            created_paths.append(effective_frontier_path)
+            np.save(output, effective_frontier, allow_pickle=False)
+        with observed_unclassified_path.open("xb") as output:
+            created_paths.append(observed_unclassified_path)
+            np.save(output, observed_unclassified, allow_pickle=False)
         visualization = belief_evidence_image(
             belief,
             frontier,
@@ -611,11 +701,42 @@ def export_belief_evidence(
     return {
         "belief_map_path": str(belief_path),
         "frontier_map_path": str(frontier_path),
+        "effective_frontier_map_path": str(effective_frontier_path),
+        "observed_unclassified_map_path": str(
+            observed_unclassified_path
+        ),
         "belief_visualization_path": str(png_path),
         "belief_map_shape": [int(value) for value in belief.shape],
         "origin_world_rc": [int(value) for value in origin_world_rc],
         "final_agent_state": (
             [int(value) for value in trajectory[-1]] if trajectory else None
+        ),
+        "frontier_semantics_mode": frontier_semantics_mode,
+        "frontier_count": frontier_snapshot.effective_frontier_count,
+        "raw_frontier_count": frontier_snapshot.raw_frontier_count,
+        "effective_frontier_count": (
+            frontier_snapshot.effective_frontier_count
+        ),
+        "observed_unclassified_unknown_count": (
+            frontier_snapshot.observed_unclassified_unknown_count
+        ),
+        "never_observed_unknown_count": (
+            frontier_snapshot.never_observed_unknown_count
+        ),
+        "frontier_removed_by_observed_unknown_count": (
+            frontier_snapshot.frontier_removed_by_observed_unknown_count
+        ),
+        "frontier_adjacent_observed_unclassified_count": (
+            frontier_snapshot.frontier_adjacent_observed_unclassified_count
+        ),
+        "effective_frontier_zero_with_observed_unclassified": bool(
+            frontier_snapshot.effective_frontier_count == 0
+            and frontier_snapshot.observed_unclassified_unknown_count > 0
+        ),
+        "observed_unclassified_evidence_cells": (
+            observed_unclassified_evidence_cells(cum_map, accumulator)
+            if accumulator is not None
+            else []
         ),
     }
 
@@ -689,6 +810,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.declare_parameter("belief_fusion_mode", "legacy")
         self.declare_parameter("belief_fusion_config", "candidate_a")
         self.declare_parameter("coarse_occlusion_mode", "off")
+        self.declare_parameter("frontier_semantics_mode", "legacy")
 
         self.max_runtime_sec = float(
             self.get_parameter("max_runtime_sec").value
@@ -770,6 +892,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.coarse_occlusion_mode = str(
             self.get_parameter("coarse_occlusion_mode").value
         ).strip().lower()
+        self.frontier_semantics_mode = str(
+            self.get_parameter("frontier_semantics_mode").value
+        ).strip().lower()
 
         self._validate_continuous_parameters()
         self._last_dynamic_scan_sequence = self.scan_sequence
@@ -805,6 +930,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "fusion_mode": self.fusion_mode,
             "fusion_config": self.fusion_config.as_dict(),
             "coarse_occlusion_mode": self.coarse_occlusion_mode,
+            "frontier_semantics_mode": self.frontier_semantics_mode,
             "termination_parameters": {
                 "minimum_completion_decision_steps": (
                     self.minimum_completion_decision_steps
@@ -858,6 +984,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "success": False,
             "belief_map_path": None,
             "frontier_map_path": None,
+            "effective_frontier_map_path": None,
+            "observed_unclassified_map_path": None,
             "belief_visualization_path": None,
             "belief_map_shape": None,
             "origin_world_rc": None,
@@ -868,6 +996,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "final_free_cells": 0,
             "final_obstacle_cells": 0,
             "final_unknown_cells": 0,
+            "raw_frontier_count": 0,
+            "effective_frontier_count": 0,
+            "observed_unclassified_unknown_count": 0,
+            "never_observed_unknown_count": 0,
+            "frontier_removed_by_observed_unknown_count": 0,
+            "frontier_adjacent_observed_unclassified_count": 0,
+            "observed_unclassified_evidence_cells": [],
+            "frontier_count_history": [],
+            "raw_frontier_count_history": [],
+            "effective_frontier_count_history": [],
+            "observed_unclassified_unknown_count_history": [],
+            "never_observed_unknown_count_history": [],
+            "frontier_removed_by_observed_unknown_count_history": [],
+            "frontier_adjacent_observed_unclassified_count_history": [],
             "safety_fallback_total_count": 0,
             "safety_fallback_rate": 0.0,
             "dynamic_stop_total_count": 0,
@@ -924,6 +1066,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"fusion_mode={self.fusion_mode} "
             f"fusion_config={self.fusion_config.name} "
             f"coarse_occlusion_mode={self.coarse_occlusion_mode} "
+            f"frontier_semantics_mode={self.frontier_semantics_mode} "
             "sensor_executor=background_multithreaded "
             "sensor_callback_groups=independent "
             "completion_source=belief_only"
@@ -1091,6 +1234,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         """Validate Round 8 invariants and bounded termination settings."""
         fusion_mode = getattr(self, "fusion_mode", "legacy")
         occlusion_mode = getattr(self, "coarse_occlusion_mode", "off")
+        frontier_mode = getattr(self, "frontier_semantics_mode", "legacy")
         if fusion_mode not in (
             "legacy",
             "evidence",
@@ -1108,6 +1252,16 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         if fusion_mode == "legacy" and occlusion_mode != "off":
             raise ValueError(
                 f"coarse_occlusion_mode='{occlusion_mode}' requires "
+                "belief_fusion_mode='evidence'"
+            )
+        if frontier_mode not in ("legacy", "evidence_aware"):
+            raise ValueError(
+                "frontier_semantics_mode must be 'legacy' or "
+                "'evidence_aware'"
+            )
+        if fusion_mode == "legacy" and frontier_mode == "evidence_aware":
+            raise ValueError(
+                "frontier_semantics_mode='evidence_aware' requires "
                 "belief_fusion_mode='evidence'"
             )
         if not math.isclose(
@@ -1741,9 +1895,17 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "known_cells": None,
                 "known_cells_delta": None,
                 "frontier_count": None,
+                "raw_frontier_count": None,
+                "effective_frontier_count": None,
+                "observed_unclassified_unknown_count": None,
+                "never_observed_unknown_count": None,
+                "frontier_removed_by_observed_unknown_count": None,
+                "frontier_adjacent_observed_unclassified_count": None,
+                "effective_frontier_zero_with_observed_unclassified": None,
                 "fusion_mode": self.fusion_mode,
                 "fusion_config": self.fusion_config.as_dict(),
                 "coarse_occlusion_mode": self.coarse_occlusion_mode,
+                "frontier_semantics_mode": self.frontier_semantics_mode,
                 "evidence_free_cells_this_step": 0,
                 "evidence_obstacle_cells_this_step": 0,
                 "evidence_conflict_cells_this_step": 0,
@@ -1941,6 +2103,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     final_cum_map,
                     evidence_result_path,
                     trajectory,
+                    (
+                        self._belief_evidence
+                        if self.fusion_mode == "evidence"
+                        else None
+                    ),
+                    self.frontier_semantics_mode,
                 )
                 self.experiment_result.update(evidence_metadata)
         except Exception as exc:
@@ -1991,16 +2159,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         frontier_count: int,
         state_history: Sequence[tuple[int, int]],
         known_history: Sequence[int],
+        observed_unclassified_unknown_count: int = 0,
     ) -> Optional[str]:
         """Evaluate belief-only completion, stagnation, and deadlock."""
         if not self._completion_enabled():
             return None
-        if frontier_exhausted(
-            frontier_count,
-            step_count,
-            known_cells,
-            self.minimum_completion_decision_steps,
-            self.minimum_completion_known_cells,
+        if (
+            observed_unclassified_unknown_count == 0
+            and frontier_exhausted(
+                frontier_count,
+                step_count,
+                known_cells,
+                self.minimum_completion_decision_steps,
+                self.minimum_completion_known_cells,
+            )
         ):
             return "frontier_exhausted"
         if known_area_stagnated(
@@ -2043,6 +2215,18 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"known_cells={record['known_cells']} "
             f"known_cells_delta={record['known_cells_delta']} "
             f"frontier_count={record['frontier_count']} "
+            f"raw_frontier_count={record['raw_frontier_count']} "
+            "effective_frontier_count="
+            f"{record['effective_frontier_count']} "
+            "observed_unclassified_unknown_count="
+            f"{record['observed_unclassified_unknown_count']} "
+            "never_observed_unknown_count="
+            f"{record['never_observed_unknown_count']} "
+            "frontier_removed_by_observed_unknown_count="
+            f"{record['frontier_removed_by_observed_unknown_count']} "
+            "frontier_adjacent_observed_unclassified_count="
+            f"{record['frontier_adjacent_observed_unclassified_count']} "
+            f"frontier_semantics_mode={record['frontier_semantics_mode']} "
             "evidence_free_cells_this_step="
             f"{record['evidence_free_cells_this_step']} "
             "evidence_obstacle_cells_this_step="
@@ -2167,6 +2351,13 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         action_history: list[int] = []
         known_history: list[int] = []
         frontier_history: list[int] = []
+        raw_frontier_history: list[int] = []
+        effective_frontier_history: list[int] = []
+        observed_unclassified_history: list[int] = []
+        never_observed_history: list[int] = []
+        removed_frontier_history: list[int] = []
+        frontier_adjacent_observed_history: list[int] = []
+        frontier_mode = getattr(self, "frontier_semantics_mode", "legacy")
         cum_map = None
         self._final_cum_map = None
         no_safe_action_count = 0
@@ -2277,7 +2468,29 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         fusion_stats,
                         f"{key}_this_step",
                     )
-                known_cells, frontier_count = belief_statistics(cum_map)
+                known_cells = int(
+                    np.count_nonzero(np.asarray(cum_map.map) != INVISIBLE)
+                )
+                frontier_snapshot = frontier_semantics_snapshot(
+                    cum_map,
+                    (
+                        self._belief_evidence
+                        if self.fusion_mode == "evidence"
+                        else None
+                    ),
+                    frontier_mode,
+                )
+                fs = frontier_snapshot
+                frontier_count = fs.effective_frontier_count
+                observed_unclassified_count = (
+                    fs.observed_unclassified_unknown_count
+                )
+                removed_frontier_count = (
+                    fs.frontier_removed_by_observed_unknown_count
+                )
+                adjacent_observed_count = (
+                    fs.frontier_adjacent_observed_unclassified_count
+                )
                 known_delta = (
                     known_cells if not known_history
                     else known_cells - known_history[-1]
@@ -2287,6 +2500,28 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "known_cells": known_cells,
                         "known_cells_delta": known_delta,
                         "frontier_count": frontier_count,
+                        "raw_frontier_count": (
+                            frontier_snapshot.raw_frontier_count
+                        ),
+                        "effective_frontier_count": (
+                            frontier_snapshot.effective_frontier_count
+                        ),
+                        "observed_unclassified_unknown_count": (
+                            observed_unclassified_count
+                        ),
+                        "never_observed_unknown_count": (
+                            frontier_snapshot.never_observed_unknown_count
+                        ),
+                        "frontier_removed_by_observed_unknown_count": (
+                            removed_frontier_count
+                        ),
+                        "frontier_adjacent_observed_unclassified_count": (
+                            adjacent_observed_count
+                        ),
+                        "effective_frontier_zero_with_observed_unclassified": (
+                            frontier_snapshot.effective_frontier_count == 0
+                            and observed_unclassified_count > 0
+                        ),
                         "evidence_free_cells_this_step": (
                             fusion_stats.evidence_free_cells_this_step
                         ),
@@ -2363,6 +2598,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 state_history.append(agent_state)
                 known_history.append(known_cells)
                 frontier_history.append(frontier_count)
+                raw_frontier_history.append(
+                    frontier_snapshot.raw_frontier_count
+                )
+                effective_frontier_history.append(
+                    frontier_snapshot.effective_frontier_count
+                )
+                observed_unclassified_history.append(
+                    observed_unclassified_count
+                )
+                never_observed_history.append(
+                    frontier_snapshot.never_observed_unknown_count
+                )
+                removed_frontier_history.append(
+                    removed_frontier_count
+                )
+                frontier_adjacent_observed_history.append(
+                    adjacent_observed_count
+                )
                 self.experiment_result["agent_state_history"] = [
                     list(state) for state in state_history
                 ]
@@ -2373,6 +2626,24 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self.experiment_result["frontier_count_history"] = (
                     frontier_history
                 )
+                self.experiment_result["raw_frontier_count_history"] = (
+                    raw_frontier_history
+                )
+                self.experiment_result[
+                    "effective_frontier_count_history"
+                ] = effective_frontier_history
+                self.experiment_result[
+                    "observed_unclassified_unknown_count_history"
+                ] = observed_unclassified_history
+                self.experiment_result[
+                    "never_observed_unknown_count_history"
+                ] = never_observed_history
+                self.experiment_result[
+                    "frontier_removed_by_observed_unknown_count_history"
+                ] = removed_frontier_history
+                self.experiment_result[
+                    "frontier_adjacent_observed_unclassified_count_history"
+                ] = frontier_adjacent_observed_history
 
                 termination = self._belief_termination(
                     step_id + 1,
@@ -2380,6 +2651,11 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     frontier_count,
                     state_history,
                     known_history,
+                    (
+                        observed_unclassified_count
+                        if frontier_mode == "evidence_aware"
+                        else 0
+                    ),
                 )
                 if termination is not None:
                     record["policy_state_build_duration_sec"] = (
@@ -2395,11 +2671,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     self._log_continuous_step(record)
                     return termination
 
-                state_batch, _state_meta = adapter.build_single_state_tensors(
-                    cum_map,
-                    agent_state,
-                    recent_trajectory_positions=recent_positions,
-                    return_state_meta=True,
+                state_batch, _state_meta = (
+                    build_policy_state_with_frontier_semantics(
+                        adapter,
+                        cum_map,
+                        agent_state,
+                        frontier_snapshot,
+                        frontier_mode,
+                        recent_positions,
+                    )
                 )
                 record["policy_state_build_duration_sec"] = (
                     time.monotonic() - state_started

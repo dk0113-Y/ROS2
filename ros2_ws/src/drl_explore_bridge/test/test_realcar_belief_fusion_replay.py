@@ -3,7 +3,9 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -116,6 +118,7 @@ def test_named_candidates_are_always_scheduled_by_cli_defaults():
 
     assert args.fusion_config == []
     assert args.coarse_occlusion_mode is None
+    assert args.frontier_semantics_mode is None
     assert set(replay.EVIDENCE_FUSION_CANDIDATES) == {
         "candidate_a",
         "candidate_b",
@@ -147,3 +150,75 @@ def test_cli_accepts_all_counterfactual_occlusion_modes():
         "opaque",
         "confirmed_opaque",
     ]
+
+
+def test_cli_accepts_both_frontier_semantics_modes():
+    """Replay can compare raw and evidence-aware policy frontiers."""
+    args = replay.build_argument_parser().parse_args(
+        [
+            "--bag",
+            "bag",
+            "--episode-json",
+            "episode.json",
+            "--output-dir",
+            "output",
+            "--frontier-semantics-mode",
+            "legacy",
+            "--frontier-semantics-mode",
+            "evidence_aware",
+        ]
+    )
+
+    assert args.frontier_semantics_mode == ["legacy", "evidence_aware"]
+
+
+def test_replay_rejects_evidence_aware_frontier_with_legacy_fusion():
+    """Replay enforces the same fusion/frontier guard as the live runner."""
+    with pytest.raises(ValueError, match="evidence_aware.*requires.*evidence"):
+        replay.replay_mode(
+            "legacy",
+            None,
+            [],
+            {},
+            object,
+            frontier_semantics_mode="evidence_aware",
+        )
+
+
+def test_replay_export_keeps_raw_and_effective_frontiers_distinct(tmp_path):
+    """Existing frontier.npy stays raw while the policy mask is separate."""
+    raw = np.array([[255, 0]], dtype=np.uint8)
+    effective = np.array([[0, 0]], dtype=np.uint8)
+    observed = np.array([[False, True]], dtype=bool)
+    snapshot = SimpleNamespace(
+        raw_frontier_u8=raw,
+        effective_frontier_u8=effective,
+        observed_unclassified_mask=observed,
+    )
+    cum_map = SimpleNamespace(
+        map=np.array([[0, -1]], dtype=np.int8),
+        origin_world_rc=(0, 0),
+    )
+
+    replay.export_mode(
+        tmp_path,
+        "candidate_a_frontier_evidence_aware",
+        cum_map,
+        snapshot,
+        {},
+        [(0, 0)],
+    )
+    mode_dir = tmp_path / "candidate_a_frontier_evidence_aware"
+
+    assert np.array_equal(
+        np.load(mode_dir / "frontier.npy", allow_pickle=False),
+        raw,
+    )
+    assert np.array_equal(
+        np.load(mode_dir / "effective_frontier.npy", allow_pickle=False),
+        effective,
+    )
+    assert np.array_equal(
+        np.load(mode_dir / "observed_unclassified.npy", allow_pickle=False),
+        observed,
+    )
