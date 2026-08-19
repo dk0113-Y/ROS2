@@ -26,6 +26,7 @@ from sensor_msgs.msg import LaserScan
 from drl_explore_bridge.realcar_action_adapter import ActionExecutionTarget
 from drl_explore_bridge.realcar_conservative_belief import (
     BeliefEvidenceAccumulator,
+    EMPTY,
     FrontierSemanticsSnapshot,
     OBSTACLE,
     ProjectedBeliefObservation,
@@ -69,6 +70,8 @@ DEFAULT_LONGITUDINAL_EXTRA_MARGIN_M = 0.05
 DEFAULT_LASER_X_IN_BASE_M = 0.03163
 DEFAULT_LASER_Y_IN_BASE_M = 0.00009
 FOOTPRINT_COMPARISON_TOLERANCE_M = 1.0e-9
+POLICY_MIXED_UNKNOWN_MODES = ("off", "conflict_only_2")
+DEFAULT_POLICY_MIXED_UNKNOWN_MODE = "off"
 
 
 class DynamicObstacleStop(RuntimeError):
@@ -264,13 +267,172 @@ class PolicyFrontierBeliefView:
         return getattr(self._cum_map, name)
 
 
+class PolicyDeploymentBeliefView:
+    """Expose temporary policy categories and one frozen frontier mask."""
+
+    def __init__(
+        self,
+        cum_map: Any,
+        categorical_map: np.ndarray,
+        frontier_u8: np.ndarray,
+    ) -> None:
+        """Copy policy-only arrays while delegating deployment metadata."""
+        categorical = np.asarray(categorical_map, dtype=np.int8)
+        frontier = np.asarray(frontier_u8)
+        belief_shape = np.asarray(cum_map.map).shape
+        if categorical.shape != belief_shape:
+            raise ValueError(
+                "policy categorical map must match cumulative belief shape"
+            )
+        if frontier.shape != belief_shape:
+            raise ValueError(
+                "policy frontier must match cumulative belief shape"
+            )
+        if not set(np.unique(categorical)).issubset(
+            {INVISIBLE, EMPTY, OBSTACLE}
+        ):
+            raise ValueError("policy categorical map must contain only -1/0/1")
+        self._cum_map = cum_map
+        self.map = np.array(categorical, copy=True)
+        self._frontier_u8 = np.array(frontier, copy=True)
+
+    @property
+    def frontier_u8(self) -> np.ndarray:
+        """Expose the selected frontier without touching the core cache."""
+        return self._frontier_u8
+
+    def get_frontier_u8(self, refresh: bool = False) -> np.ndarray:
+        """Return the selected policy frontier for every read path."""
+        _ = refresh
+        return self._frontier_u8
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate visit state, coordinates, and topology to the belief."""
+        return getattr(self._cum_map, name)
+
+
+def normalize_policy_mixed_unknown_mode(mode: str) -> str:
+    """Validate and normalize the explicit mixed-UNKNOWN policy mode."""
+    normalized = str(mode).strip().lower()
+    if normalized not in POLICY_MIXED_UNKNOWN_MODES:
+        choices = "', '".join(POLICY_MIXED_UNKNOWN_MODES)
+        raise ValueError(
+            f"policy_mixed_unknown_mode must be '{choices}'"
+        )
+    return normalized
+
+
+def persistent_mixed_unknown_cells(
+    cum_map: Any,
+    accumulator: Optional[BeliefEvidenceAccumulator],
+    policy_mixed_unknown_mode: str,
+) -> frozenset[tuple[int, int]]:
+    """Select exact M1 pure-conflict, unknown, unvisited world cells."""
+    mode = normalize_policy_mixed_unknown_mode(policy_mixed_unknown_mode)
+    if mode == "off":
+        return frozenset()
+    if accumulator is None:
+        raise ValueError(
+            "policy_mixed_unknown_mode='conflict_only_2' requires "
+            "evidence fusion"
+        )
+    belief = np.asarray(cum_map.map)
+    visits = np.asarray(cum_map.visit_count)
+    if belief.shape != visits.shape:
+        raise ValueError("visit_count must match cumulative belief shape")
+    origin_row, origin_col = (
+        int(value) for value in cum_map.origin_world_rc
+    )
+    selected: set[tuple[int, int]] = set()
+    for cell, state in accumulator.cells.items():
+        array_row = int(cell[0]) - origin_row
+        array_col = int(cell[1]) - origin_col
+        if not (
+            0 <= array_row < belief.shape[0]
+            and 0 <= array_col < belief.shape[1]
+            and int(belief[array_row, array_col]) == INVISIBLE
+            and int(visits[array_row, array_col]) == 0
+        ):
+            continue
+        if (
+            int(state.conflict_frame_count) >= 2
+            and int(state.free_frame_count) == 0
+            and int(state.obstacle_frame_count) == 0
+        ):
+            selected.add((int(cell[0]), int(cell[1])))
+    return frozenset(selected)
+
+
+def policy_mixed_unknown_mask(
+    cum_map: Any,
+    cells: Sequence[tuple[int, int]],
+) -> np.ndarray:
+    """Convert selected world cells to a map-shaped boolean mask."""
+    mask = np.zeros(np.asarray(cum_map.map).shape, dtype=bool)
+    origin_row, origin_col = (
+        int(value) for value in cum_map.origin_world_rc
+    )
+    for row, col in cells:
+        array_row = int(row) - origin_row
+        array_col = int(col) - origin_col
+        if not (
+            0 <= array_row < mask.shape[0]
+            and 0 <= array_col < mask.shape[1]
+        ):
+            raise ValueError("mixed-UNKNOWN cell is outside cumulative map")
+        mask[array_row, array_col] = True
+    return mask
+
+
+def policy_categorical_map(
+    cum_map: Any,
+    accumulator: Optional[BeliefEvidenceAccumulator],
+    policy_mixed_unknown_mode: str,
+) -> tuple[np.ndarray, frozenset[tuple[int, int]]]:
+    """Build a temporary {-1,0,1} policy map without mutating belief."""
+    categorical = np.array(cum_map.map, dtype=np.int8, copy=True)
+    cells = persistent_mixed_unknown_cells(
+        cum_map,
+        accumulator,
+        policy_mixed_unknown_mode,
+    )
+    mask = policy_mixed_unknown_mask(cum_map, cells)
+    categorical[mask] = OBSTACLE
+    if not set(np.unique(categorical)).issubset(
+        {INVISIBLE, EMPTY, OBSTACLE}
+    ):
+        raise AssertionError("mixed policy view introduced a fourth category")
+    return categorical, cells
+
+
 def policy_belief_view(
     cum_map: Any,
     frontier_snapshot: FrontierSemanticsSnapshot,
     frontier_semantics_mode: str,
+    policy_mixed_unknown_mode: str = "off",
+    accumulator: Optional[BeliefEvidenceAccumulator] = None,
 ) -> Any:
     """Select the exact cumulative-map view consumed by the DRL adapter."""
     mode = str(frontier_semantics_mode).strip().lower()
+    mixed_mode = normalize_policy_mixed_unknown_mode(
+        policy_mixed_unknown_mode
+    )
+    if mixed_mode == "conflict_only_2":
+        if mode != "evidence_aware":
+            raise ValueError(
+                "policy_mixed_unknown_mode='conflict_only_2' requires "
+                "frontier_semantics_mode='evidence_aware'"
+            )
+        categorical, _cells = policy_categorical_map(
+            cum_map,
+            accumulator,
+            mixed_mode,
+        )
+        return PolicyDeploymentBeliefView(
+            cum_map,
+            categorical,
+            frontier_snapshot.effective_frontier_u8,
+        )
     if mode == "legacy":
         return cum_map
     if mode == "evidence_aware":
@@ -290,12 +452,16 @@ def build_policy_state_with_frontier_semantics(
     frontier_snapshot: FrontierSemanticsSnapshot,
     frontier_semantics_mode: str,
     recent_positions: Sequence[tuple[int, int]],
+    policy_mixed_unknown_mode: str = "off",
+    accumulator: Optional[BeliefEvidenceAccumulator] = None,
 ) -> tuple[Any, Any]:
     """Build model state from the selected raw or effective frontier."""
     policy_map = policy_belief_view(
         cum_map,
         frontier_snapshot,
         frontier_semantics_mode,
+        policy_mixed_unknown_mode,
+        accumulator,
     )
     return adapter.build_single_state_tensors(
         policy_map,
@@ -638,6 +804,7 @@ def export_belief_evidence(
     trajectory_world_rc: Sequence[tuple[int, int]],
     accumulator: Optional[BeliefEvidenceAccumulator] = None,
     frontier_semantics_mode: str = "legacy",
+    policy_mixed_unknown_mode: str = "off",
 ) -> dict[str, Any]:
     """Export final read-only belief evidence beside an episode JSON path."""
     belief = np.array(cum_map.map, copy=True)
@@ -649,6 +816,15 @@ def export_belief_evidence(
     frontier = frontier_snapshot.raw_frontier_u8
     effective_frontier = frontier_snapshot.effective_frontier_u8
     observed_unclassified = frontier_snapshot.observed_unclassified_mask
+    mixed_mode = normalize_policy_mixed_unknown_mode(
+        policy_mixed_unknown_mode
+    )
+    policy_view, mixed_cells = policy_categorical_map(
+        cum_map,
+        accumulator,
+        mixed_mode,
+    )
+    mixed_mask = policy_mixed_unknown_mask(cum_map, mixed_cells)
     origin_world_rc = tuple(int(value) for value in cum_map.origin_world_rc)
     trajectory = [
         (int(state[0]), int(state[1])) for state in trajectory_world_rc
@@ -669,6 +845,12 @@ def export_belief_evidence(
     observed_unclassified_path = result_path.with_name(
         f"{result_path.stem}_observed_unclassified.npy"
     )
+    policy_mixed_unknown_path = result_path.with_name(
+        f"{result_path.stem}_policy_mixed_unknown.npy"
+    )
+    policy_categorical_view_path = result_path.with_name(
+        f"{result_path.stem}_policy_categorical_view.npy"
+    )
     png_path = result_path.with_name(f"{result_path.stem}_belief.png")
     created_paths: list[Path] = []
     try:
@@ -684,6 +866,13 @@ def export_belief_evidence(
         with observed_unclassified_path.open("xb") as output:
             created_paths.append(observed_unclassified_path)
             np.save(output, observed_unclassified, allow_pickle=False)
+        if mixed_mode != "off":
+            with policy_mixed_unknown_path.open("xb") as output:
+                created_paths.append(policy_mixed_unknown_path)
+                np.save(output, mixed_mask, allow_pickle=False)
+            with policy_categorical_view_path.open("xb") as output:
+                created_paths.append(policy_categorical_view_path)
+                np.save(output, policy_view, allow_pickle=False)
         visualization = belief_evidence_image(
             belief,
             frontier,
@@ -705,6 +894,19 @@ def export_belief_evidence(
         "observed_unclassified_map_path": str(
             observed_unclassified_path
         ),
+        "policy_mixed_unknown_map_path": (
+            str(policy_mixed_unknown_path) if mixed_mode != "off" else None
+        ),
+        "policy_categorical_view_path": (
+            str(policy_categorical_view_path)
+            if mixed_mode != "off"
+            else None
+        ),
+        "policy_mixed_unknown_mode": mixed_mode,
+        "policy_mixed_unknown_count": len(mixed_cells),
+        "policy_mixed_unknown_cells": [
+            [int(row), int(col)] for row, col in sorted(mixed_cells)
+        ],
         "belief_visualization_path": str(png_path),
         "belief_map_shape": [int(value) for value in belief.shape],
         "origin_world_rc": [int(value) for value in origin_world_rc],
@@ -811,6 +1013,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.declare_parameter("belief_fusion_config", "candidate_a")
         self.declare_parameter("coarse_occlusion_mode", "off")
         self.declare_parameter("frontier_semantics_mode", "legacy")
+        self.declare_parameter(
+            "policy_mixed_unknown_mode",
+            DEFAULT_POLICY_MIXED_UNKNOWN_MODE,
+        )
 
         self.max_runtime_sec = float(
             self.get_parameter("max_runtime_sec").value
@@ -895,6 +1101,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         self.frontier_semantics_mode = str(
             self.get_parameter("frontier_semantics_mode").value
         ).strip().lower()
+        self.policy_mixed_unknown_mode = str(
+            self.get_parameter("policy_mixed_unknown_mode").value
+        ).strip().lower()
 
         self._validate_continuous_parameters()
         self._last_dynamic_scan_sequence = self.scan_sequence
@@ -931,6 +1140,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "fusion_config": self.fusion_config.as_dict(),
             "coarse_occlusion_mode": self.coarse_occlusion_mode,
             "frontier_semantics_mode": self.frontier_semantics_mode,
+            "policy_mixed_unknown_mode": self.policy_mixed_unknown_mode,
             "termination_parameters": {
                 "minimum_completion_decision_steps": (
                     self.minimum_completion_decision_steps
@@ -986,6 +1196,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "frontier_map_path": None,
             "effective_frontier_map_path": None,
             "observed_unclassified_map_path": None,
+            "policy_mixed_unknown_map_path": None,
+            "policy_categorical_view_path": None,
             "belief_visualization_path": None,
             "belief_map_shape": None,
             "origin_world_rc": None,
@@ -1002,6 +1214,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "never_observed_unknown_count": 0,
             "frontier_removed_by_observed_unknown_count": 0,
             "frontier_adjacent_observed_unclassified_count": 0,
+            "policy_mixed_unknown_count": 0,
+            "policy_mixed_unknown_cells": [],
             "observed_unclassified_evidence_cells": [],
             "frontier_count_history": [],
             "raw_frontier_count_history": [],
@@ -1010,6 +1224,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "never_observed_unknown_count_history": [],
             "frontier_removed_by_observed_unknown_count_history": [],
             "frontier_adjacent_observed_unclassified_count_history": [],
+            "policy_mixed_unknown_count_history": [],
             "safety_fallback_total_count": 0,
             "safety_fallback_rate": 0.0,
             "dynamic_stop_total_count": 0,
@@ -1067,6 +1282,8 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             f"fusion_config={self.fusion_config.name} "
             f"coarse_occlusion_mode={self.coarse_occlusion_mode} "
             f"frontier_semantics_mode={self.frontier_semantics_mode} "
+            "policy_mixed_unknown_mode="
+            f"{self.policy_mixed_unknown_mode} "
             "sensor_executor=background_multithreaded "
             "sensor_callback_groups=independent "
             "completion_source=belief_only"
@@ -1235,6 +1452,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         fusion_mode = getattr(self, "fusion_mode", "legacy")
         occlusion_mode = getattr(self, "coarse_occlusion_mode", "off")
         frontier_mode = getattr(self, "frontier_semantics_mode", "legacy")
+        mixed_mode = normalize_policy_mixed_unknown_mode(
+            getattr(self, "policy_mixed_unknown_mode", "off")
+        )
         if fusion_mode not in (
             "legacy",
             "evidence",
@@ -1263,6 +1483,19 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             raise ValueError(
                 "frontier_semantics_mode='evidence_aware' requires "
                 "belief_fusion_mode='evidence'"
+            )
+        if mixed_mode == "conflict_only_2" and fusion_mode != "evidence":
+            raise ValueError(
+                "policy_mixed_unknown_mode='conflict_only_2' requires "
+                "belief_fusion_mode='evidence'"
+            )
+        if (
+            mixed_mode == "conflict_only_2"
+            and frontier_mode != "evidence_aware"
+        ):
+            raise ValueError(
+                "policy_mixed_unknown_mode='conflict_only_2' requires "
+                "frontier_semantics_mode='evidence_aware'"
             )
         if not math.isclose(
             self.cell_size,
@@ -1906,6 +2139,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 "fusion_config": self.fusion_config.as_dict(),
                 "coarse_occlusion_mode": self.coarse_occlusion_mode,
                 "frontier_semantics_mode": self.frontier_semantics_mode,
+                "policy_mixed_unknown_mode": (
+                    self.policy_mixed_unknown_mode
+                ),
+                "policy_mixed_unknown_count": 0,
+                "policy_mixed_unknown_count_this_step": 0,
+                "policy_mixed_unknown_cells": [],
                 "evidence_free_cells_this_step": 0,
                 "evidence_obstacle_cells_this_step": 0,
                 "evidence_conflict_cells_this_step": 0,
@@ -1943,6 +2182,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 ],
                 "q_values": None,
                 "q_ranked": None,
+                "raw_policy_action_target_state": None,
+                "raw_policy_target_is_mixed_unknown": None,
+                "raw_policy_target_adjacent_mixed_unknown": None,
                 "executed_action": None,
                 "target_distance": None,
                 "capsule_front_edge": None,
@@ -2109,6 +2351,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         else None
                     ),
                     self.frontier_semantics_mode,
+                    getattr(self, "policy_mixed_unknown_mode", "off"),
                 )
                 self.experiment_result.update(evidence_metadata)
         except Exception as exc:
@@ -2227,6 +2470,10 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "frontier_adjacent_observed_unclassified_count="
             f"{record['frontier_adjacent_observed_unclassified_count']} "
             f"frontier_semantics_mode={record['frontier_semantics_mode']} "
+            "policy_mixed_unknown_mode="
+            f"{record['policy_mixed_unknown_mode']} "
+            "policy_mixed_unknown_count="
+            f"{record['policy_mixed_unknown_count']} "
             "evidence_free_cells_this_step="
             f"{record['evidence_free_cells_this_step']} "
             "evidence_obstacle_cells_this_step="
@@ -2251,6 +2498,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
             "obstacle_promotions_total="
             f"{record['obstacle_promotions_total']} "
             f"raw_policy_action={record['raw_policy_action']} "
+            "raw_policy_action_target_state="
+            f"{record['raw_policy_action_target_state']} "
+            "raw_policy_target_is_mixed_unknown="
+            f"{record['raw_policy_target_is_mixed_unknown']} "
+            "raw_policy_target_adjacent_mixed_unknown="
+            f"{record['raw_policy_target_adjacent_mixed_unknown']} "
             f"action_source={record['action_source']} "
             f"executed_action={record['executed_action']} "
             f"safety_fallback_used={record['safety_fallback_used']} "
@@ -2357,7 +2610,9 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
         never_observed_history: list[int] = []
         removed_frontier_history: list[int] = []
         frontier_adjacent_observed_history: list[int] = []
+        policy_mixed_unknown_count_history: list[int] = []
         frontier_mode = getattr(self, "frontier_semantics_mode", "legacy")
+        mixed_mode = getattr(self, "policy_mixed_unknown_mode", "off")
         cum_map = None
         self._final_cum_map = None
         no_safe_action_count = 0
@@ -2480,6 +2735,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     ),
                     frontier_mode,
                 )
+                mixed_cells = persistent_mixed_unknown_cells(
+                    cum_map,
+                    (
+                        self._belief_evidence
+                        if self.fusion_mode == "evidence"
+                        else None
+                    ),
+                    mixed_mode,
+                )
                 fs = frontier_snapshot
                 frontier_count = fs.effective_frontier_count
                 observed_unclassified_count = (
@@ -2522,6 +2786,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                             frontier_snapshot.effective_frontier_count == 0
                             and observed_unclassified_count > 0
                         ),
+                        "policy_mixed_unknown_mode": mixed_mode,
+                        "policy_mixed_unknown_count": len(mixed_cells),
+                        "policy_mixed_unknown_count_this_step": len(
+                            mixed_cells
+                        ),
+                        "policy_mixed_unknown_cells": [
+                            [int(row), int(col)]
+                            for row, col in sorted(mixed_cells)
+                        ],
                         "evidence_free_cells_this_step": (
                             fusion_stats.evidence_free_cells_this_step
                         ),
@@ -2616,6 +2889,7 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 frontier_adjacent_observed_history.append(
                     adjacent_observed_count
                 )
+                policy_mixed_unknown_count_history.append(len(mixed_cells))
                 self.experiment_result["agent_state_history"] = [
                     list(state) for state in state_history
                 ]
@@ -2644,6 +2918,16 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                 self.experiment_result[
                     "frontier_adjacent_observed_unclassified_count_history"
                 ] = frontier_adjacent_observed_history
+                self.experiment_result[
+                    "policy_mixed_unknown_count_history"
+                ] = policy_mixed_unknown_count_history
+                self.experiment_result["policy_mixed_unknown_count"] = len(
+                    mixed_cells
+                )
+                self.experiment_result["policy_mixed_unknown_cells"] = [
+                    [int(row), int(col)]
+                    for row, col in sorted(mixed_cells)
+                ]
 
                 termination = self._belief_termination(
                     step_id + 1,
@@ -2679,6 +2963,12 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         frontier_snapshot,
                         frontier_mode,
                         recent_positions,
+                        mixed_mode,
+                        (
+                            self._belief_evidence
+                            if self.fusion_mode == "evidence"
+                            else None
+                        ),
                     )
                 )
                 record["policy_state_build_duration_sec"] = (
@@ -2699,6 +2989,20 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                     reverse=True,
                 )
                 raw_action = int(torch.argmax(q_values, dim=1).item())
+                action_delta = ACTIONS_8[raw_action]
+                raw_target_state = (
+                    int(agent_state[0]) + int(action_delta[0]),
+                    int(agent_state[1]) + int(action_delta[1]),
+                )
+                raw_target_is_mixed = raw_target_state in mixed_cells
+                raw_target_adjacent_mixed = any(
+                    max(
+                        abs(raw_target_state[0] - cell[0]),
+                        abs(raw_target_state[1] - cell[1]),
+                    )
+                    == 1
+                    for cell in mixed_cells
+                )
                 requested_action = (
                     self.commissioning_action_idx
                     if self.commissioning_mode
@@ -2709,6 +3013,15 @@ class RealcarPolicyContinuousRunner(RealcarPolicySafeRunner):
                         "q_values": q_list,
                         "q_ranked": q_ranked,
                         "raw_policy_action": raw_action,
+                        "raw_policy_action_target_state": list(
+                            raw_target_state
+                        ),
+                        "raw_policy_target_is_mixed_unknown": (
+                            raw_target_is_mixed
+                        ),
+                        "raw_policy_target_adjacent_mixed_unknown": (
+                            raw_target_adjacent_mixed
+                        ),
                         "pre_motion_requested_action": requested_action,
                     }
                 )

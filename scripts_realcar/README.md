@@ -460,6 +460,55 @@ legacy fusion 也只支持 `off`。
 将最后一项显式改为 `frontier_semantics_mode:=evidence_aware` 才启用 observed/unobserved
 frontier 过滤；该组合要求 `belief_fusion_mode:=evidence`。
 
+### M1 persistent mixed UNKNOWN policy-only view
+
+`policy_mixed_unknown_mode` 是一个显式、opt-in 的 production candidate 参数，只允许：
+
+- `off`：默认值，保留历史 policy-state 调用路径；不会生成 M1 policy mask/view 文件。
+- `conflict_only_2`：只把同时满足 `cum_map.map == INVISIBLE`、`visit_count == 0`、
+  `conflict_frame_count >= 2`、`free_frame_count == 0` 和
+  `obstacle_frame_count == 0` 的 persistent pure-conflict UNKNOWN cell，在本次 DRL inference
+  使用的临时 categorical view 中从 `-1` 显示为 `1`。
+
+`conflict_only_2` 要求 `belief_fusion_mode=evidence` 和
+`frontier_semantics_mode=evidence_aware`；`coarse_occlusion_mode` 仍可为 `off`、`opaque` 或
+`confirmed_opaque`。未知 mode 或不满足 guard 的组合会显式失败，不会静默退回 `off`。
+候选配置示例：
+
+```bash
+ros2 run drl_explore_bridge realcar_policy_continuous_runner_node --ros-args \
+  -p belief_fusion_mode:=evidence \
+  -p belief_fusion_config:=candidate_a \
+  -p coarse_occlusion_mode:=confirmed_opaque \
+  -p frontier_semantics_mode:=evidence_aware \
+  -p policy_mixed_unknown_mode:=conflict_only_2
+```
+
+每个 decision 的顺序固定为 evidence projection、`apply_evidence_fusion()`、累计 categorical
+belief、`frontier_semantics_snapshot()`、M1 cell selection、临时 categorical policy view、
+既有 effective frontier view、`StateTensorAdapter` 和 model inference。因此第二个当前 decision
+conflict frame 可以在该次 inference 前生效。组合 view 的 `.map` 只包含 `-1/0/1`，
+`get_frontier_u8()` 返回已经计算好的 effective frontier；不会从修改后的临时 map 重算
+frontier。
+
+M1 只改变 network input。真实 `cum_map.map` 中这些 cell 始终保持 UNKNOWN，visit state 和
+evidence accumulator 不变；raw/effective frontier、evidence-aware completion、
+`confirmed_opaque` blocker extraction、LaserScan footprint safety、dynamic stop、local escape
+和所有 frozen geometry/threshold 均不变。尤其，policy-view OBSTACLE 不是 belief OBSTACLE，
+不会成为 confirmed-opaque blocker，也不会直接成为 safety obstacle。SLAM `/map` 继续只用于
+记录/评估，从不进入 belief 或 policy。
+
+step/episode JSON 记录 `policy_mixed_unknown_mode`、count、cell list、count history，以及 raw
+policy action 的 target state、target 是否为 M1 cell、target 是否与 M1 cell 8-neighbor 相邻。
+启用 M1 时，最终 evidence export 另存 `*_policy_mixed_unknown.npy` boolean mask 和明确命名的
+`*_policy_categorical_view.npy`；原有 `*_belief.npy`、`*_belief.png`、raw/effective frontier
+文件的 categorical 含义保持不变。
+
+该模式是从 same-recorded-state offline M1 study 独立实现的 deployment candidate。当前验证只
+证明 production code 与冻结 M1 定义及离线回放一致，尚未证明 closed-loop intervention rate、
+exploration efficiency、safety fallback 或 autonomous exploration 会改善；必须先做 real-car
+dry-run，再做 bounded live commissioning。
+
 `execute=false` 只验证 loop、belief、inference、sensor barrier、termination plumbing 和
 JSON logging；静止机器人不会提供真实运动后的状态变化，因此不能证明连续自主探索。
 Round 8 的 0.35m cardinal step、约 0.495m diagonal step、动态停车阈值和净空余量均

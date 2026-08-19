@@ -18,7 +18,11 @@ from drl_explore_bridge.realcar_action_adapter import (
 )
 from drl_explore_bridge.realcar_conservative_belief import (
     BeliefEvidenceAccumulator,
+    EMPTY,
+    OBSTACLE,
     ProjectedBeliefObservation,
+    apply_evidence_fusion,
+    cumulative_occlusion_cells,
     frontier_semantics_snapshot,
     named_fusion_config,
 )
@@ -28,6 +32,7 @@ from drl_explore_bridge import (
 from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     CONTINUOUS_CELL_SIZE_M,
     CONTINUOUS_DEFAULT_MAX_STEPS,
+    DEFAULT_POLICY_MIXED_UNKNOWN_MODE,
     DEFAULT_DYNAMIC_STOP_RECOVERY_LIMIT,
     DEFAULT_LOCAL_ESCAPE_RECOVERY_LIMIT,
     DEFAULT_FOOTPRINT_RADIUS_M,
@@ -57,6 +62,9 @@ from drl_explore_bridge.realcar_policy_continuous_runner_node import (
     hard_limit_termination,
     known_area_stagnated,
     motion_is_permitted,
+    normalize_policy_mixed_unknown_mode,
+    persistent_mixed_unknown_cells,
+    policy_categorical_map,
     repeated_state_deadlock,
     scan_capsule_footprint_check,
     scan_points_in_base,
@@ -436,6 +444,61 @@ class PolicyStateAdapter:
         return {}, {}
 
 
+class MixedUnknownBelief:
+    """Expose a small expandable-map read surface for M1 unit tests."""
+
+    def __init__(self):
+        self.map = np.full((5, 5), -1, dtype=np.int8)
+        self.visit_count = np.zeros((5, 5), dtype=np.int32)
+        self.origin_world_rc = (0, 0)
+        self.frontier_u8 = np.zeros((5, 5), dtype=np.uint8)
+        self.frontier_u8[0, 1] = 255
+
+    def get_frontier_u8(self, refresh=False):
+        """Return the stable raw frontier used by tests."""
+        _ = refresh
+        return self.frontier_u8
+
+
+class CapturingPolicyAdapter:
+    """Capture the exact categorical and frontier arrays seen by policy."""
+
+    def __init__(self):
+        self.consumed_map = None
+        self.consumed_frontier = None
+
+    def build_single_state_tensors(self, cum_map, _agent_state, **_kwargs):
+        """Record deployment-view arrays and return a minimal state."""
+        self.consumed_map = np.array(cum_map.map, copy=True)
+        self.consumed_frontier = np.array(
+            cum_map.get_frontier_u8(), copy=True
+        )
+        return {"map": torch.tensor(self.consumed_map)}, {}
+
+
+def mixed_unknown_fixture():
+    """Return a blank belief and candidate-a evidence accumulator."""
+    return (
+        MixedUnknownBelief(),
+        BeliefEvidenceAccumulator(named_fusion_config("candidate_a")),
+    )
+
+
+def set_mixed_evidence(
+    accumulator,
+    cell=(1, 1),
+    conflict=0,
+    free=0,
+    obstacle=0,
+):
+    """Set exact accepted-frame counts without invoking classification."""
+    state = accumulator.state_for(cell)
+    state.conflict_frame_count = conflict
+    state.free_frame_count = free
+    state.obstacle_frame_count = obstacle
+    return state
+
+
 class SequencedPolicyModel:
     """Return a different deterministic action on each inference."""
 
@@ -505,6 +568,7 @@ class ContinuousRunHarness(RealcarPolicyContinuousRunner):
         self.commissioning_action_idx = 0 if commissioning_mode else -1
         self.execute = execute
         self.fusion_mode = "legacy"
+        self.policy_mixed_unknown_mode = DEFAULT_POLICY_MIXED_UNKNOWN_MODE
         self.fusion_config = named_fusion_config("candidate_a")
         self._belief_evidence = BeliefEvidenceAccumulator(
             self.fusion_config
@@ -978,12 +1042,50 @@ def test_belief_evidence_export_preserves_map_and_metadata(tmp_path):
     assert metadata["belief_map_shape"] == [2, 3]
     assert metadata["origin_world_rc"] == [-14, 27]
     assert metadata["final_agent_state"] == [-13, 28]
+    assert metadata["policy_mixed_unknown_mode"] == "off"
+    assert metadata["policy_mixed_unknown_count"] == 0
+    assert metadata["policy_mixed_unknown_map_path"] is None
+    assert metadata["policy_categorical_view_path"] is None
     assert np.array_equal(cum_map.map, map_before)
     assert np.array_equal(cum_map.frontier_u8, frontier_before)
     assert cum_map.origin_world_rc == origin_before
     assert (tmp_path / "episode_belief.png").read_bytes().startswith(
         b"\x89PNG\r\n\x1a\n"
     )
+
+
+def test_m1_export_separates_policy_view_from_belief(tmp_path):
+    """M1 exports explicit mask/view files without relabeling belief."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2)
+    belief_before = belief.map.copy()
+
+    metadata = export_belief_evidence(
+        belief,
+        tmp_path / "episode.json",
+        [(2, 2)],
+        accumulator,
+        "evidence_aware",
+        "conflict_only_2",
+    )
+
+    exported_belief = np.load(
+        metadata["belief_map_path"], allow_pickle=False
+    )
+    mixed_mask = np.load(
+        metadata["policy_mixed_unknown_map_path"], allow_pickle=False
+    )
+    policy_view = np.load(
+        metadata["policy_categorical_view_path"], allow_pickle=False
+    )
+    assert np.array_equal(exported_belief, belief_before)
+    assert exported_belief[1, 1] == -1
+    assert mixed_mask.dtype == np.bool_
+    assert np.count_nonzero(mixed_mask) == 1
+    assert mixed_mask[1, 1]
+    assert policy_view[1, 1] == OBSTACLE
+    assert metadata["policy_mixed_unknown_cells"] == [[1, 1]]
+    assert np.array_equal(belief.map, belief_before)
 
 
 @pytest.mark.parametrize(
@@ -1043,6 +1145,351 @@ def test_policy_consumes_selected_frontier_semantics(
     assert np.array_equal(belief.frontier_u8, raw_before)
 
 
+def test_policy_mixed_unknown_default_is_off():
+    """The new production surface remains opt-in."""
+    assert DEFAULT_POLICY_MIXED_UNKNOWN_MODE == "off"
+
+
+def test_policy_mixed_unknown_off_matches_omitted_old_state_path():
+    """Explicit off and the backward-compatible omitted argument agree."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=3)
+    snapshot = frontier_semantics_snapshot(
+        belief, accumulator, "evidence_aware"
+    )
+    implicit = CapturingPolicyAdapter()
+    explicit = CapturingPolicyAdapter()
+
+    implicit_state, _ = build_policy_state_with_frontier_semantics(
+        implicit,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+    )
+    explicit_state, _ = build_policy_state_with_frontier_semantics(
+        explicit,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+        "off",
+        accumulator,
+    )
+
+    assert torch.equal(implicit_state["map"], explicit_state["map"])
+    assert np.array_equal(implicit.consumed_map, belief.map)
+    assert np.array_equal(explicit.consumed_map, belief.map)
+    assert np.array_equal(
+        implicit.consumed_frontier, explicit.consumed_frontier
+    )
+
+
+def test_unknown_policy_mixed_unknown_mode_is_rejected():
+    """Unknown modes cannot silently fall back to off."""
+    with pytest.raises(ValueError, match="policy_mixed_unknown_mode"):
+        normalize_policy_mixed_unknown_mode("dominant_2")
+
+
+def test_conflict_only_2_parameter_requires_evidence_fusion():
+    """M1 cannot run without an evidence accumulator."""
+    harness = valid_continuous_parameter_harness(
+        "legacy", "off", "legacy"
+    )
+    harness.policy_mixed_unknown_mode = "conflict_only_2"
+
+    with pytest.raises(ValueError, match="conflict_only_2.*evidence"):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_conflict_only_2_parameter_requires_evidence_aware_frontier():
+    """The production candidate keeps its frozen frontier semantics."""
+    harness = valid_continuous_parameter_harness(
+        "evidence", "confirmed_opaque", "legacy"
+    )
+    harness.policy_mixed_unknown_mode = "conflict_only_2"
+
+    with pytest.raises(ValueError, match="conflict_only_2.*evidence_aware"):
+        RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+@pytest.mark.parametrize("occlusion_mode", ("off", "opaque", "confirmed_opaque"))
+def test_conflict_only_2_accepts_all_evidence_occlusion_modes(occlusion_mode):
+    """M1 never changes or infers coarse-occlusion configuration."""
+    harness = valid_continuous_parameter_harness(
+        "evidence", occlusion_mode, "evidence_aware"
+    )
+    harness.policy_mixed_unknown_mode = "conflict_only_2"
+
+    RealcarPolicyContinuousRunner._validate_continuous_parameters(harness)
+
+
+def test_conflict_one_is_not_remapped():
+    """One pure-conflict frame is below the frozen threshold."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=1)
+
+    cells = persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+
+
+@pytest.mark.parametrize("conflict", (2, 3))
+def test_pure_conflict_two_or_more_is_remapped(conflict):
+    """Unknown, unvisited, pure-conflict cells meet exact M1."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=conflict)
+
+    cells = persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset({(1, 1)})
+
+
+def test_conflict_two_with_free_evidence_is_not_remapped():
+    """Any accepted free-only frame excludes a cell from M1."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2, free=1)
+
+    cells = persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+
+
+def test_conflict_two_with_obstacle_evidence_is_not_remapped():
+    """Any accepted obstacle-only frame excludes a cell from M1."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2, obstacle=1)
+
+    cells = persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+
+
+def test_known_free_is_never_mixed_remapped():
+    """A formally free categorical cell remains free in policy input."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.map[1, 1] = EMPTY
+    set_mixed_evidence(accumulator, conflict=2)
+
+    categorical, cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+    assert categorical[1, 1] == EMPTY
+
+
+def test_known_obstacle_is_unchanged():
+    """A formally classified obstacle is not a policy-only promotion."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.map[1, 1] = OBSTACLE
+    set_mixed_evidence(accumulator, conflict=2)
+
+    categorical, cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+    assert categorical[1, 1] == OBSTACLE
+
+
+def test_visited_unknown_is_never_mixed_remapped():
+    """Visit state is authoritative even for a synthetic unknown cell."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.visit_count[1, 1] = 1
+    set_mixed_evidence(accumulator, conflict=2)
+
+    cells = persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+
+
+def test_visited_free_is_unchanged():
+    """M1 does not alter ordinary traversed FREE cells."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.map[1, 1] = EMPTY
+    belief.visit_count[1, 1] = 1
+    set_mixed_evidence(accumulator, conflict=3)
+
+    categorical, cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset()
+    assert categorical[1, 1] == EMPTY
+
+
+def test_mixed_policy_map_has_no_fourth_category():
+    """The DRL adapter still receives exactly {-1,0,1}."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.map[4, 4] = OBSTACLE
+    belief.map[3, 3] = EMPTY
+    set_mixed_evidence(accumulator, conflict=2)
+
+    categorical, _cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert set(np.unique(categorical)) == {-1, 0, 1}
+
+
+def test_mixed_policy_map_and_accumulator_are_immutable():
+    """Building M1 changes neither categorical belief nor evidence."""
+    belief, accumulator = mixed_unknown_fixture()
+    state = set_mixed_evidence(accumulator, conflict=2)
+    map_before = belief.map.copy()
+    state_before = vars(state).copy()
+
+    categorical, cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+
+    assert cells == frozenset({(1, 1)})
+    assert categorical[1, 1] == OBSTACLE
+    assert belief.map[1, 1] == -1
+    assert np.array_equal(belief.map, map_before)
+    assert vars(state) == state_before
+
+
+def test_mixed_policy_state_preserves_raw_and_effective_frontiers():
+    """M1 consumes but never recomputes the effective frontier mask."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2)
+    snapshot = frontier_semantics_snapshot(
+        belief, accumulator, "evidence_aware"
+    )
+    raw_before = belief.frontier_u8.copy()
+    effective_before = snapshot.effective_frontier_u8.copy()
+    adapter = CapturingPolicyAdapter()
+
+    build_policy_state_with_frontier_semantics(
+        adapter,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+        "conflict_only_2",
+        accumulator,
+    )
+
+    assert np.array_equal(belief.frontier_u8, raw_before)
+    assert np.array_equal(snapshot.effective_frontier_u8, effective_before)
+    assert np.array_equal(adapter.consumed_frontier, effective_before)
+
+
+def test_confirmed_opaque_ignores_policy_only_obstacles():
+    """Only formal unvisited belief obstacles enter blocker extraction."""
+    belief, accumulator = mixed_unknown_fixture()
+    belief.map[4, 4] = OBSTACLE
+    set_mixed_evidence(accumulator, conflict=2)
+
+    categorical, cells = policy_categorical_map(
+        belief, accumulator, "conflict_only_2"
+    )
+    blockers, _visited = cumulative_occlusion_cells(belief)
+
+    assert categorical[1, 1] == OBSTACLE
+    assert cells == frozenset({(1, 1)})
+    assert blockers == frozenset({(4, 4)})
+    assert (1, 1) not in blockers
+
+
+def test_m1_network_consumes_modified_categorical_map():
+    """The production state builder passes M1 categories to the adapter."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2)
+    snapshot = frontier_semantics_snapshot(
+        belief, accumulator, "evidence_aware"
+    )
+    adapter = CapturingPolicyAdapter()
+
+    build_policy_state_with_frontier_semantics(
+        adapter,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+        "conflict_only_2",
+        accumulator,
+    )
+
+    assert adapter.consumed_map[1, 1] == OBSTACLE
+    assert belief.map[1, 1] == -1
+
+
+def test_off_network_consumes_original_categorical_map():
+    """Off mode exposes the original category even with M1-like evidence."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=2)
+    snapshot = frontier_semantics_snapshot(
+        belief, accumulator, "evidence_aware"
+    )
+    adapter = CapturingPolicyAdapter()
+
+    build_policy_state_with_frontier_semantics(
+        adapter,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+        "off",
+        accumulator,
+    )
+
+    assert np.array_equal(adapter.consumed_map, belief.map)
+    assert adapter.consumed_map[1, 1] == -1
+
+
+def test_current_decision_evidence_precedes_m1_state_build():
+    """The second current-frame conflict activates M1 before inference."""
+    belief, accumulator = mixed_unknown_fixture()
+    set_mixed_evidence(accumulator, conflict=1)
+    assert not persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    )
+    observation = ProjectedBeliefObservation(
+        local_snap=np.full((3, 3), -1, dtype=np.int8),
+        obstacle_cells=frozenset(),
+        conflict_cells=frozenset({(1, 1)}),
+    )
+
+    apply_evidence_fusion(belief, accumulator, observation)
+    snapshot = frontier_semantics_snapshot(
+        belief, accumulator, "evidence_aware"
+    )
+    adapter = CapturingPolicyAdapter()
+    build_policy_state_with_frontier_semantics(
+        adapter,
+        belief,
+        (2, 2),
+        snapshot,
+        "evidence_aware",
+        [(2, 2)],
+        "conflict_only_2",
+        accumulator,
+    )
+
+    assert persistent_mixed_unknown_cells(
+        belief, accumulator, "conflict_only_2"
+    ) == frozenset({(1, 1)})
+    assert adapter.consumed_map[1, 1] == OBSTACLE
+
+
 def test_final_trajectory_diagnostics_use_unique_cells():
     class Belief:
         origin_world_rc = (60, 60)
@@ -1092,6 +1539,7 @@ def valid_continuous_parameter_harness(
         fusion_mode=fusion_mode,
         coarse_occlusion_mode=occlusion_mode,
         frontier_semantics_mode=frontier_semantics_mode,
+        policy_mixed_unknown_mode=DEFAULT_POLICY_MIXED_UNKNOWN_MODE,
         cell_size=0.35,
         step_distance=0.35,
         diagonal_mode="grid_center",
