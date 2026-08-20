@@ -19,6 +19,9 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = ROOT / "cell035_slam_map_with_map_frame_trajectory_clean_600x600.png"
 UNKNOWN_GRAY = 205 / 255
+TRAJECTORY_COLOR = "#5185c0"
+START_COLOR = "#55966b"
+END_COLOR = "#c96144"
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,9 +78,26 @@ def main() -> None:
         origin="upper",
         interpolation="nearest",
     )
-    axes.plot(trajectory_x, trajectory_y, color="#1f77b4", linewidth=1.5)
-    axes.scatter(trajectory_x[0], trajectory_y[0], color="#1f77b4", marker="o", s=50)
-    axes.scatter(trajectory_x[-1], trajectory_y[-1], color="#ff7f0e", marker="x", s=70)
+    axes.plot(trajectory_x, trajectory_y, color=TRAJECTORY_COLOR, linewidth=1.5)
+    axes.scatter(
+        trajectory_x[0],
+        trajectory_y[0],
+        color=START_COLOR,
+        edgecolors="white",
+        linewidths=1.0,
+        marker="o",
+        s=50,
+        zorder=3,
+    )
+    axes.scatter(
+        trajectory_x[-1],
+        trajectory_y[-1],
+        color=END_COLOR,
+        linewidths=2.0,
+        marker="x",
+        s=70,
+        zorder=3,
+    )
     axes.set_xlim(-0.5, map_width - 0.5)
     axes.set_ylim(map_height - 0.5, -0.5)
     axes.set_aspect("equal", adjustable="box")
